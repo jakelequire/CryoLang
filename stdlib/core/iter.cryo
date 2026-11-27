@@ -4,13 +4,15 @@
 ///! is derived from it. Implementations drive the sequence; consumers
 ///! call `next` in a loop or use one of the defaults below.
 ///!
-///! Lazy adapters live in this module: `map`, `filter`, `take`, `skip`,
-///! `chain`, `enumerate`, `zip`, `reverse` and `flat_map` each return
+///! Lazy adapters live in this module: `map`, `filter`, `filter_map`,
+///! `take`, `take_while`, `skip`, `skip_while`, `step_by`, `chain`,
+///! `enumerate`, `zip`, `reverse`, `flat_map` and `flatten` each return
 ///! `implement Iterator<...>`, a wrapper iterator that is itself an
 ///! `Iterator`, so they compose; `peekable` returns `implement Peekable<...>`,
-///! an iterator that adds `peek`. Eager consumers (`for_each`,
-///! `fold`, `any`, `all`, `find`, `count`, `collect`, `sum`) and
-///! `for (x in iter)` drive the chain. The adapters resolve directly on any concrete `Iterator` receiver,
+///! an iterator that adds `peek`. Eager consumers (`for_each`, `fold`,
+///! `any`, `all`, `find`, `position`, `count`, `last`, `nth`, `collect`,
+///! `sum`, `product`, `min` / `max` and their `_by` and `_by_key` forms)
+///! and `for (x in iter)` drive the chain. The adapters resolve directly on any concrete `Iterator` receiver,
 ///! including a user struct that `implement`s `Iterator`
 ///! (`mut c: Counter = ...; c.take(3).map(f)`), not just stdlib iterators.
 ///! (Re-adapting an opaque-typed iterator *local* works when the
@@ -22,9 +24,10 @@
 
 namespace std::core::iter;
 
+import std::core::intrinsics;
 import std::core::option::{ Option };
 import std::core::clone;
-import std::core::cmp::{ Ord };
+import std::core::cmp::{ Ord, Ordering };
 import std::collections::pair::{ Pair };
 
 /// A source of values handed out one at a time by `next`, until it
@@ -167,6 +170,39 @@ public type trait Iterator {
         return FlatMapIterator::<This, F, B> { inner: this, f: f, current: Option::None };
     }
 
+    /// Yield the elements of each iterator this one yields, in turn: an
+    /// iterator of iterators read as one sequence.
+    flatten(this) -> implement Iterator<This::Item::Item> where This::Item: Iterator {
+        return FlattenIterator::<This, This::Item> { inner: this, current: Option::None };
+    }
+
+    /// Yield elements while `pred` holds, and stop at the first for which
+    /// it does not; that element is taken from `this` and not yielded.
+    /// `pred` borrows each element, as `filter`'s does.
+    take_while<P>(this, pred: P) -> implement Iterator<This::Item> where P: (&This::Item) -> boolean {
+        return TakeWhileIterator { inner: this, pred: pred, done: false };
+    }
+
+    /// Discard elements while `pred` holds, then yield the first for which
+    /// it does not and every element after it, testing no more.
+    skip_while<P>(this, pred: P) -> implement Iterator<This::Item> where P: (&This::Item) -> boolean {
+        return SkipWhileIterator { inner: this, pred: pred, skipping: true };
+    }
+
+    /// Yield the first element, then every `step`-th after it: elements 0,
+    /// `step`, `2 * step`, ...  A `step` below 1 panics, as no element would
+    /// ever come after the first.
+    step_by(this, step: i64) -> implement Iterator<This::Item> {
+        if (step < 1) { panic("Iterator.step_by: the step is below 1", intrinsics::location()); }
+        return StepByIterator { inner: this, gap: step - 1, started: false };
+    }
+
+    /// Map each element with `f` and yield the values inside the `Some`s
+    /// it returns, skipping each element it answers `None` for.
+    filter_map<B, F>(this, f: F) -> implement Iterator<B> where F: (This::Item) -> Option<B> {
+        return FilterMapIterator::<This, F, B> { inner: this, f: f };
+    }
+
 
     /// True if `pred` holds for at least one element. Short-circuits on
     /// the first match; consumes elements up to it.
@@ -251,6 +287,145 @@ public type trait Iterator {
                 }
             }
         }
+    }
+
+    /// The smallest element as `compare` orders them, or `None` for an
+    /// empty iterator.  On ties the first wins, as in `min`.
+    min_by<F>(mut &this, compare: F) -> Option<This::Item> where F: (&This::Item, &This::Item) -> Ordering {
+        match (this.next()) {
+            Option::None => { return Option::None; }
+            Option::Some(first) => {
+                mut best: This::Item = first;
+                loop {
+                    match (this.next()) {
+                        Option::Some(value) => {
+                            if (compare(&value, &best).is_less()) { best = value; }
+                        }
+                        Option::None => { return Option::Some(best); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The largest element as `compare` orders them, or `None` for an
+    /// empty iterator.  On ties the last wins, as in `max`.
+    max_by<F>(mut &this, compare: F) -> Option<This::Item> where F: (&This::Item, &This::Item) -> Ordering {
+        match (this.next()) {
+            Option::None => { return Option::None; }
+            Option::Some(first) => {
+                mut best: This::Item = first;
+                loop {
+                    match (this.next()) {
+                        Option::Some(value) => {
+                            if (compare(&value, &best).is_greater_or_equal()) { best = value; }
+                        }
+                        Option::None => { return Option::Some(best); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The element whose `key` is smallest by `Ord`, or `None` for an
+    /// empty iterator.  On ties the first wins, as in `min`.  `key` is
+    /// called once per element.
+    min_by_key<K, F>(mut &this, key: F) -> Option<This::Item> where F: (&This::Item) -> K, K: Ord {
+        match (this.next()) {
+            Option::None => { return Option::None; }
+            Option::Some(first) => {
+                mut best_key: K = key(&first);
+                mut best: This::Item = first;
+                loop {
+                    match (this.next()) {
+                        Option::Some(value) => {
+                            const value_key: K = key(&value);
+                            if (value_key.compare(&best_key).is_less()) {
+                                best_key = value_key;
+                                best = value;
+                            }
+                        }
+                        Option::None => { return Option::Some(best); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The element whose `key` is largest by `Ord`, or `None` for an
+    /// empty iterator.  On ties the last wins, as in `max`.  `key` is
+    /// called once per element.
+    max_by_key<K, F>(mut &this, key: F) -> Option<This::Item> where F: (&This::Item) -> K, K: Ord {
+        match (this.next()) {
+            Option::None => { return Option::None; }
+            Option::Some(first) => {
+                mut best_key: K = key(&first);
+                mut best: This::Item = first;
+                loop {
+                    match (this.next()) {
+                        Option::Some(value) => {
+                            const value_key: K = key(&value);
+                            if (value_key.compare(&best_key).is_greater_or_equal()) {
+                                best_key = value_key;
+                                best = value;
+                            }
+                        }
+                        Option::None => { return Option::Some(best); }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The last element, or `None` for an empty iterator.  Consumes the
+    /// iterator.
+    last(mut &this) -> Option<This::Item> {
+        mut found: Option<This::Item> = Option::None;
+        loop {
+            match (this.next()) {
+                Option::Some(value) => { found = Option::Some(value); }
+                Option::None => { return found; }
+            }
+        }
+    }
+
+    /// The element at position `n`, counting from 0, or `None` when there
+    /// are no more than `n`.  The elements before it are taken and
+    /// released; a negative `n` answers `None` and takes nothing.
+    nth(mut &this, n: i64) -> Option<This::Item> {
+        if (n < 0) { return Option::None; }
+        mut remaining: i64 = n;
+        loop {
+            match (this.next()) {
+                Option::Some(value) => {
+                    if (remaining == 0) { return Option::Some(value); }
+                    remaining = remaining - 1;
+                }
+                Option::None => { return Option::None; }
+            }
+        }
+    }
+
+    /// The position, counting from 0, of the first element for which
+    /// `pred` holds, or `None`.  Consumes elements up to and including that
+    /// one.
+    position<P>(mut &this, pred: P) -> Option<i64> where P: (This::Item) -> boolean {
+        mut index: i64 = 0;
+        loop {
+            match (this.next()) {
+                Option::Some(value) => {
+                    if (pred(value)) { return Option::Some(index); }
+                    index = index + 1;
+                }
+                Option::None => { return Option::None; }
+            }
+        }
+    }
+
+    /// The product of every element; an iterator with none multiplies to
+    /// one.
+    product<S>(this) -> S where S: Product, This: Iterator<S> {
+        return S::product(this);
     }
 }
 
@@ -441,6 +616,27 @@ implement trait Sum for usize { static sum<I>(source: I) -> usize where I: Itera
 implement trait Sum for f32   { static sum<I>(source: I) -> f32   where I: Iterator<f32>   { mut total: f32 = 0.0; for (value in source) { total = total + value; } return total; } }
 implement trait Sum for f64   { static sum<I>(source: I) -> f64   where I: Iterator<f64>   { mut total: f64 = 0.0; for (value in source) { total = total + value; } return total; } }
 
+/// A type an iterator of its values multiplies into, by `Iterator.product`.
+public type trait Product {
+    /// The product of every value `source` yields; one for none.
+    static product<I>(source: I) -> This where I: Iterator<This>;
+}
+
+implement trait Product for i8    { static product<I>(source: I) -> i8    where I: Iterator<i8>    { mut total: i8 = 1;    for (value in source) { total = total * value; } return total; } }
+implement trait Product for i16   { static product<I>(source: I) -> i16   where I: Iterator<i16>   { mut total: i16 = 1;   for (value in source) { total = total * value; } return total; } }
+implement trait Product for i32   { static product<I>(source: I) -> i32   where I: Iterator<i32>   { mut total: i32 = 1;   for (value in source) { total = total * value; } return total; } }
+implement trait Product for i64   { static product<I>(source: I) -> i64   where I: Iterator<i64>   { mut total: i64 = 1;   for (value in source) { total = total * value; } return total; } }
+implement trait Product for i128  { static product<I>(source: I) -> i128  where I: Iterator<i128>  { mut total: i128 = 1;  for (value in source) { total = total * value; } return total; } }
+implement trait Product for isize { static product<I>(source: I) -> isize where I: Iterator<isize> { mut total: isize = 1; for (value in source) { total = total * value; } return total; } }
+implement trait Product for u8    { static product<I>(source: I) -> u8    where I: Iterator<u8>    { mut total: u8 = 1;    for (value in source) { total = total * value; } return total; } }
+implement trait Product for u16   { static product<I>(source: I) -> u16   where I: Iterator<u16>   { mut total: u16 = 1;   for (value in source) { total = total * value; } return total; } }
+implement trait Product for u32   { static product<I>(source: I) -> u32   where I: Iterator<u32>   { mut total: u32 = 1;   for (value in source) { total = total * value; } return total; } }
+implement trait Product for u64   { static product<I>(source: I) -> u64   where I: Iterator<u64>   { mut total: u64 = 1;   for (value in source) { total = total * value; } return total; } }
+implement trait Product for u128  { static product<I>(source: I) -> u128  where I: Iterator<u128>  { mut total: u128 = 1;  for (value in source) { total = total * value; } return total; } }
+implement trait Product for usize { static product<I>(source: I) -> usize where I: Iterator<usize> { mut total: usize = 1; for (value in source) { total = total * value; } return total; } }
+implement trait Product for f32   { static product<I>(source: I) -> f32   where I: Iterator<f32>   { mut total: f32 = 1.0; for (value in source) { total = total * value; } return total; } }
+implement trait Product for f64   { static product<I>(source: I) -> f64   where I: Iterator<f64>   { mut total: f64 = 1.0; for (value in source) { total = total * value; } return total; } }
+
 /// An iterator that also yields from its back end.  `next` and `next_back`
 /// draw from one sequence, so between them each element is yielded once.
 public type trait DoubleEndedIterator : Iterator {
@@ -537,6 +733,142 @@ where I: Iterator, Mapper: (I::Item) -> U, U: Iterator<O> {
             }
             match (this.inner.next()) {
                 Option::Some(element) => { this.current = Option::Some(this.f(element)); }
+                Option::None => { return Option::None; }
+            }
+        }
+    }
+}
+
+/// Adapter yielding the elements of each iterator `inner` yields, in turn.
+/// `U` is the iterator `inner` yields; the element type `O` lives in the
+/// implementation's bounds, as in `FlatMapIterator`.
+internal type struct FlattenIterator<I, U> where I: Iterator<U> {
+    private inner: I;
+    private current: Option<U>;
+}
+
+implement<I, U, O> trait Iterator<O> for struct FlattenIterator<I, U>
+where I: Iterator<U>, U: Iterator<O> {
+    next(mut &this) -> Option<O> {
+        loop {
+            match (this.current.as_mutable_reference()) {
+                Option::Some(current) => {
+                    match (current.next()) {
+                        Option::Some(value) => { return Option::Some(value); }
+                        Option::None => { }
+                    }
+                }
+                Option::None => { }
+            }
+            match (this.inner.next()) {
+                Option::Some(element) => { this.current = Option::Some(element); }
+                Option::None => { return Option::None; }
+            }
+        }
+    }
+}
+
+/// Adapter yielding the elements of `inner` until `pred` first fails; once
+/// it has, `done` keeps every later `next` from asking `inner` again.
+internal type struct TakeWhileIterator<I, Predicate> where I: Iterator, Predicate: (&I::Item) -> boolean {
+    private inner: I;
+    private pred:  Predicate;
+    private done:  boolean;
+}
+
+implement<I, Predicate> trait Iterator<I::Item> for struct TakeWhileIterator<I, Predicate>
+where I: Iterator, Predicate: (&I::Item) -> boolean {
+    next(mut &this) -> Option<I::Item> {
+        if (this.done) { return Option::None; }
+        match (this.inner.next()) {
+            Option::Some(value) => {
+                if (this.pred(value)) { return Option::Some(value); }
+                this.done = true;
+                return Option::None;
+            }
+            Option::None => {
+                this.done = true;
+                return Option::None;
+            }
+        }
+    }
+}
+
+/// Adapter discarding the elements of `inner` while `pred` holds, then
+/// passing every element through; `skipping` is cleared at the first
+/// element `pred` refuses.
+internal type struct SkipWhileIterator<I, Predicate> where I: Iterator, Predicate: (&I::Item) -> boolean {
+    private inner:    I;
+    private pred:     Predicate;
+    private skipping: boolean;
+}
+
+implement<I, Predicate> trait Iterator<I::Item> for struct SkipWhileIterator<I, Predicate>
+where I: Iterator, Predicate: (&I::Item) -> boolean {
+    next(mut &this) -> Option<I::Item> {
+        while (this.skipping) {
+            match (this.inner.next()) {
+                Option::Some(value) => {
+                    if (!this.pred(value)) {
+                        this.skipping = false;
+                        return Option::Some(value);
+                    }
+                }
+                Option::None => {
+                    this.skipping = false;
+                    return Option::None;
+                }
+            }
+        }
+        return this.inner.next();
+    }
+}
+
+/// Adapter yielding the first element of `inner`, then each element after
+/// `gap` more are discarded.
+internal type struct StepByIterator<I> {
+    private inner:   I;
+    private gap:     i64;
+    private started: boolean;
+}
+
+implement<I, A> trait Iterator<A> for struct StepByIterator<I>
+where I: Iterator<A> {
+    next(mut &this) -> Option<A> {
+        if (this.started) {
+            mut skipped: i64 = 0;
+            while (skipped < this.gap) {
+                match (this.inner.next()) {
+                    // Payload dropped by the `_` match, as in `count`.
+                    Option::Some(_) => { skipped = skipped + 1; }
+                    Option::None    => { return Option::None; }
+                }
+            }
+        }
+        this.started = true;
+        return this.inner.next();
+    }
+}
+
+/// Adapter yielding the value of each `Some` that `f` makes of an element
+/// of `inner`, skipping the elements it makes `None` of.  The result-type
+/// parameter is `O` for the reason `MapIterator`'s is.
+internal type struct FilterMapIterator<I, Mapper, O> where I: Iterator, Mapper: (I::Item) -> Option<O> {
+    private inner: I;
+    private f:     Mapper;
+}
+
+implement<I, Mapper, O> trait Iterator<O> for struct FilterMapIterator<I, Mapper, O>
+where I: Iterator, Mapper: (I::Item) -> Option<O> {
+    next(mut &this) -> Option<O> {
+        loop {
+            match (this.inner.next()) {
+                Option::Some(value) => {
+                    match (this.f(value)) {
+                        Option::Some(mapped) => { return Option::Some(mapped); }
+                        Option::None => { }
+                    }
+                }
                 Option::None => { return Option::None; }
             }
         }

@@ -1,0 +1,205 @@
+///! core::iter - the adapters that stop or skip by a test (`take_while`,
+///! `skip_while`), thin a sequence (`step_by`), map and drop in one step
+///! (`filter_map`), read an iterator of iterators as one (`flatten`), and
+///! the consumers that pick an element (`last`, `nth`, `position`, the
+///! `_by` and `_by_key` forms of `min` and `max`) or multiply them all
+///! (`product`).
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::IterAdapters;
+
+import std::core::result::{ Result };
+import std::core::option::{ Option };
+import std::core::cmp::{ Ord, Ordering };
+import std::core::iter::{ Iterator };
+import std::core::ops::{ Range };
+import std::collections::array::{ Array };
+import std::collections::pair::{ Pair };
+import std::collections::str::{ Str };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect_equal, expect_none, expect_true };
+
+![test]
+function take_while_stops_at_the_first_refused_element() -> Result<(), TestError> {
+    const taken: Array<i32> = (1..10).take_while((n: &i32) -> boolean { return *n < 4; }).collect();
+    expect_equal(taken.length(), 3)?;
+    expect_equal(taken[0], 1)?;
+    expect_equal(taken[2], 3)?;
+    // A later element that passes the test again is not reached.
+    mut source: Array<i32> = Array::<i32>::new();
+    source.push(1); source.push(5); source.push(2);
+    const again: Array<i32> = source.iter().take_while((n: &i32) -> boolean { return *n < 3; }).collect();
+    expect_equal(again.length(), 1)?;
+    return expect_equal(again[0], 1);
+}
+
+![test]
+function take_while_asks_its_source_no_more_once_refused() -> Result<(), TestError> {
+    mut source: Range<i32> = 1..10;
+    mut head = source.take_while((n: &i32) -> boolean { return *n < 3; });
+    expect_equal(head.next(), Option::Some(1))?;
+    expect_equal(head.next(), Option::Some(2))?;
+    expect_none(&head.next(), "3 is refused")?;
+    return expect_none(&head.next(), "nothing after the refusal");
+}
+
+![test]
+function skip_while_tests_only_until_the_first_refusal() -> Result<(), TestError> {
+    const rest: Array<i32> = (1..7).skip_while((n: &i32) -> boolean { return *n < 3; }).collect();
+    expect_equal(rest.length(), 4)?;
+    expect_equal(rest[0], 3)?;
+    expect_equal(rest[3], 6)?;
+    mut source: Array<i32> = Array::<i32>::new();
+    source.push(1); source.push(5); source.push(2);
+    const kept: Array<i32> = source.iter().skip_while((n: &i32) -> boolean { return *n < 3; }).collect();
+    // 2 passes the test, but testing stopped at 5.
+    expect_equal(kept.length(), 2)?;
+    expect_equal(kept[0], 5)?;
+    return expect_equal(kept[1], 2);
+}
+
+![test]
+function skip_while_over_everything_yields_nothing() -> Result<(), TestError> {
+    mut rest = (1..4).skip_while((n: &i32) -> boolean { return true; });
+    expect_none(&rest.next(), "every element is skipped")?;
+    return expect_none(&rest.next(), "and stays exhausted");
+}
+
+![test]
+function step_by_yields_the_first_then_every_step() -> Result<(), TestError> {
+    const thinned: Array<i32> = (0..10).step_by(3).collect();
+    expect_equal(thinned.length(), 4)?;
+    expect_equal(thinned[0], 0)?;
+    expect_equal(thinned[1], 3)?;
+    expect_equal(thinned[2], 6)?;
+    expect_equal(thinned[3], 9)?;
+    const every: Array<i32> = (0..4).step_by(1).collect();
+    expect_equal(every.length(), 4)?;
+    const past: Array<i32> = (0..3).step_by(10).collect();
+    expect_equal(past.length(), 1)?;
+    return expect_equal(past[0], 0);
+}
+
+![test]
+![should_panic]
+function step_by_zero_panics() -> Result<(), TestError> {
+    const none: Array<i32> = (0..3).step_by(0).collect();
+    return expect_equal(none.length(), 0);
+}
+
+![test]
+function filter_map_keeps_the_values_of_the_somes() -> Result<(), TestError> {
+    const tens: Array<i32> = (1..6).filter_map((n: i32) -> Option<i32> {
+        if (n % 2 == 0) { return Option::Some(n * 10); }
+        return Option::None;
+    }).collect();
+    expect_equal(tens.length(), 2)?;
+    expect_equal(tens[0], 20)?;
+    return expect_equal(tens[1], 40);
+}
+
+![test]
+function filter_map_changes_the_element_type() -> Result<(), TestError> {
+    mut words: Array<Str> = Array::<Str>::new();
+    words.push("12"); words.push("x"); words.push("-3");
+    const numbers: Array<i64> = words.iter().filter_map((word: Str) -> Option<i64> {
+        return i64::try_from(word).ok();
+    }).collect();
+    expect_equal(numbers.length(), 2)?;
+    expect_equal(numbers[0], 12)?;
+    return expect_equal(numbers[1], -3);
+}
+
+![test]
+function flatten_reads_each_inner_iterator_in_turn() -> Result<(), TestError> {
+    // 0..0 is empty, 0..1 is 0, 0..2 is 0 1, 0..3 is 0 1 2.
+    const flat: Array<i32> = (0..4).map((n: i32) -> Range<i32> { return 0..n; }).flatten().collect();
+    expect_equal(flat.length(), 6)?;
+    expect_equal(flat[0], 0)?;
+    expect_equal(flat[1], 0)?;
+    expect_equal(flat[2], 1)?;
+    expect_equal(flat[5], 2)?;
+    mut empty = (0..3).map((n: i32) -> Range<i32> { return 0..0; }).flatten();
+    return expect_none(&empty.next(), "every inner iterator is empty");
+}
+
+![test]
+function last_is_the_final_element() -> Result<(), TestError> {
+    expect_equal((1..5).last(), Option::Some(4))?;
+    return expect_none(&(1..1).last(), "an empty range has no last element");
+}
+
+![test]
+function nth_counts_from_zero_and_takes_what_it_passes() -> Result<(), TestError> {
+    mut source: Range<i32> = 10..20;
+    expect_equal(source.nth(3), Option::Some(13))?;
+    // The elements before it are gone; counting starts again after it.
+    expect_equal(source.nth(0), Option::Some(14))?;
+    expect_none(&source.nth(100), "past the end")?;
+    mut fresh: Range<i32> = 10..20;
+    expect_none(&fresh.nth(-1), "a negative position")?;
+    return expect_equal(fresh.next(), Option::Some(10));
+}
+
+![test]
+function position_finds_the_first_match() -> Result<(), TestError> {
+    const seven: Option<i64> = (5..10).position((n: i32) -> boolean { return n == 7; });
+    expect_equal(seven.unwrap(), 2)?;
+    const first: Option<i64> = (5..10).position((n: i32) -> boolean { return n > 0; });
+    expect_equal(first.unwrap(), 0)?;
+    return expect_none(&(5..10).position((n: i32) -> boolean { return n > 100; }), "no element matches");
+}
+
+/// The descending order of two integers.
+function descending(a: &i32, b: &i32) -> Ordering {
+    return b.compare(a);
+}
+
+![test]
+function min_by_and_max_by_order_by_the_comparison() -> Result<(), TestError> {
+    // In descending order the smallest is the largest integer.
+    expect_equal((1..6).min_by(descending), Option::Some(5))?;
+    expect_equal((1..6).max_by(descending), Option::Some(1))?;
+    return expect_none(&(1..1).min_by(descending), "an empty range has no smallest");
+}
+
+/// Two pairs by their second member alone.
+function by_second(a: &Pair<i64, i32>, b: &Pair<i64, i32>) -> Ordering {
+    return a.second.compare(&b.second);
+}
+
+![test]
+function min_by_keeps_the_first_tie_and_max_by_the_last() -> Result<(), TestError> {
+    mut values: Array<i32> = Array::<i32>::new();
+    values.push(3); values.push(1); values.push(1); values.push(3);
+    const smallest: Pair<i64, i32> = values.iter().enumerate().min_by(by_second).unwrap();
+    expect_equal(smallest.first, 1)?;
+    const largest: Pair<i64, i32> = values.iter().enumerate().max_by(by_second).unwrap();
+    return expect_equal(largest.first, 3);
+}
+
+![test]
+function min_by_key_and_max_by_key_order_by_the_key() -> Result<(), TestError> {
+    mut words: Array<Str> = Array::<Str>::new();
+    words.push("ccc"); words.push("a"); words.push("bb"); words.push("dd");
+    const shortest: Str = words.iter().min_by_key((word: &Str) -> i64 { return word.length(); }).unwrap();
+    expect_true(shortest == Str::new("a"), "the shortest word")?;
+    const longest: Str = words.iter().max_by_key((word: &Str) -> i64 { return word.length(); }).unwrap();
+    expect_true(longest == Str::new("ccc"), "the longest word")?;
+    // Among the two of length 2, the first is the smallest and the last
+    // the largest.
+    const first_two: Str = words.iter().skip(2).min_by_key((word: &Str) -> i64 { return word.length(); }).unwrap();
+    expect_true(first_two == Str::new("bb"), "the first of a tie is the smallest")?;
+    const last_two: Str = words.iter().skip(2).max_by_key((word: &Str) -> i64 { return word.length(); }).unwrap();
+    return expect_true(last_two == Str::new("dd"), "the last of a tie is the largest");
+}
+
+![test]
+function product_multiplies_every_element() -> Result<(), TestError> {
+    const factorial: i32 = (1..6).product();
+    expect_equal(factorial, 120)?;
+    const nothing: i64 = (1..1).map((n: i32) -> i64 { return n as i64; }).product();
+    expect_equal(nothing, 1)?;
+    const halves: f64 = (1..4).map((n: i32) -> f64 { return 0.5; }).product();
+    return expect_true(halves == 0.125, "three halves multiply to an eighth");
+}
