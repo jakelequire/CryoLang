@@ -160,6 +160,13 @@ yet is recorded with the change that builds it, not here.
      temporaries are released with the enclosing statement's.  (Jake, the
      v1 freeze)
 
+731. **A reference is not read where its referent's type is declared.**
+     A `&T` passed where `T` is declared is refused everywhere (E0214),
+     with the fix writing `*value`: a free function read through it, a
+     static method and an enum payload took its address, and an instance
+     method was refused as a missing method.  A `T*` for `T` is not
+     covered by this ruling.  (Jake, the v1 freeze)
+
 ### 2026-11-26
 
 725. **`Str`'s text methods take their text by value.**  `contains`,
