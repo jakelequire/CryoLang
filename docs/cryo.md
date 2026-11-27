@@ -1856,6 +1856,18 @@ An arm written after an unguarded arm that matches every value - `_` or a bindin
 
 A literal or range pattern is of its literal's kind, and that kind must be the subject's own type: an integer pattern matches an integer subject, a string pattern a `string`, a character pattern a `char`. A pattern of any other kind is refused at the pattern (`E0200`) rather than built as an arm that never matches - `"x"` against a struct subject is an error, not a dead arm.
 
+A string pattern also matches a subject of another type that a string converts to where that type is declared (section 16.1.1): the subject's type declares the literal's type, as a typed binding does, so the literal is converted by the same converter, and the arm is taken when the subject `==` the converted literal - the `==` of two values of the type, answered by its `Eq`. A `Str` subject matches its text this way, by length and bytes, so a view into longer text matches a pattern of exactly its own text. The subject is evaluated once, and the patterns are tested in order as any others are. A subject's type with no converter from a string is refused as before (`E0200`); one with a converter and no `Eq` is refused at the pattern as the `==` would be (`E0229`). A reference is not looked through: `match (*s)` matches the text a `&Str` refers to.
+
+```cryo
+function command(word: Str) -> i32 {
+    return match (word) {
+        "start" | "go" => { 1 }
+        "stop"         => { 2 }
+        _              => { 0 }
+    };
+}
+```
+
 A constant pattern is held to the subject's type the same way: the constant's type must be the subject's own (in a payload position, the payload's), so a `u32` constant against an `i32` subject is refused (`E0200`) rather than read at the subject's width. A constant is compared by value, so its type must be an integer, `char`, `boolean`, float, `string` or an enum whose variants carry no payload; a constant of any other type is refused (`E0113`). A `string` constant compares by content. A float constant compares as `==` does: `0.0` and `-0.0` match each other, and NaN matches nothing - an `f64::NAN` arm is never chosen, and a NaN subject falls through every float constant. An arm whose constant's value is NaN is reported (`W0016`); test for NaN with `is_nan()` in a guard instead.
 
 ### 7.2 Enum Destructuring

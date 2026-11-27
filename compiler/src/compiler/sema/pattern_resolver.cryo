@@ -704,8 +704,11 @@ type struct PatternResolver {
     /// reference, pointer or alias to do it.  So the subject's own type must be
     /// the pattern's kind: a string pattern needs a `string` subject, a char
     /// pattern or range a `char` one, an integer pattern or range an integer or
-    /// `char` one, `true` / `false` a `boolean` one.  A pattern let past here
-    /// has nothing to compare against and would never match.
+    /// `char` one, `true` / `false` a `boolean` one.  A string pattern given a
+    /// test of its own (`resolve_text_patterns`: the literal converted to the
+    /// subject's type, compared through its `Eq`) fits any subject.  A pattern
+    /// let past here has nothing to compare against and would never match; one
+    /// whose test was already refused is not reported again.
     check_literal_patterns(mut &this, arms: &[mut MatchArmNode*], subject_type: TypeRef) -> void {
         mut subject: Type* = null;
         if (subject_type.is_valid()) { subject = this.arena.lookup(subject_type); }
@@ -714,7 +717,7 @@ type struct PatternResolver {
             if (arm == null) { continue; }
             for (mut j: i64 = 0; j < arm.patterns.length(); j++) {
                 const pat: Pattern* = arm.patterns[j];
-                if (pat == null) { continue; }
+                if (pat == null || pat.has_error) { continue; }
                 mut tested: boolean = false;
                 mut literal_kind: LiteralKind = LiteralKind::Integer;
                 mut range: RangePattern* = null;
@@ -766,7 +769,18 @@ type struct PatternResolver {
         mut wants: string = "";
         match (literal_kind) {
             LiteralKind::String  => {
-                fits = k == TypeKind::String; kind = "string"; wants = "a `string`";
+                const tested: boolean = match (pat.kind) {
+                    PatternKind::Literal(l) => { l.equals != null }
+                    _                       => { false }
+                };
+                if (k == TypeKind::String || tested) { return; }
+                mut diag: Diagnostic = Diagnostic::error(ErrorCode::E0200_TYPE_MISMATCH,
+                    fmt::format("string pattern requires a `string` subject, or one a string converts to, found `%s`",
+                        this.arena.resolve_display_name(subject_type)));
+                diag = diag.at(pat.span);
+                diag = diag.with_note("a string pattern compares a `string` subject by content, and a subject of another type through its `Eq`, with the literal converted to that type by the converter declared for it");
+                this.ctx.emit_diagnostic(diag);
+                return;
             }
             LiteralKind::Char    => {
                 fits = k == TypeKind::Char; kind = "char"; wants = "a `char`";

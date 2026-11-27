@@ -11,7 +11,7 @@ namespace compiler::interpret::patterns;
 
 import compiler::ast::{ LiteralKind, MemberPin, PatternBinding, PatternElement };
 import compiler::ast::expression::{ ExpressionNode };
-import compiler::ast::pattern::{ EnumPattern, MatchArmNode, Pattern, PatternKind };
+import compiler::ast::pattern::{ EnumPattern, LiteralPattern, MatchArmNode, Pattern, PatternKind };
 import compiler::diag::source_span::{ SourceSpan };
 import compiler::interpret::integer::{ IntegerKind, TrueValue };
 import compiler::interpret::interpreter::{ Interpreter, Operand };
@@ -68,6 +68,7 @@ implement struct Interpreter {
             PatternKind::Binding(_)  => { Result::Ok(true) }
             PatternKind::Enum(e)     => { this.matches_variant(e, place, t, pattern.span) }
             PatternKind::Literal(l)  => {
+                if (l.equals != null) { return this.matches_by_test(l, place, t, pattern.span); }
                 match (l.literal_kind) {
                     LiteralKind::Boolean => {
                         const value: Scalar = this.load(place, pattern.span)?;
@@ -80,6 +81,17 @@ implement struct Interpreter {
             PatternKind::Range(_)    => { Result::Err(Interpreter::not_covered("a range pattern", pattern.span)) }
             PatternKind::Constant(_) => { Result::Err(Interpreter::not_covered("a constant pattern", pattern.span)) }
         };
+    }
+
+    /// Whether the value of type `t` at `place` passes the test the type
+    /// check gave `literal` (`subject == <the converted literal>`), with the
+    /// local that test reads naming the value where it lies.
+    matches_by_test(mut &this, literal: LiteralPattern*, place: Address, t: TypeRef, span: SourceSpan) -> Result<boolean, Stop> {
+        this.push_scope();
+        this.bind_in_place(literal.subject, place, t);
+        const taken: boolean = this.condition(literal.equals)?;
+        this.pop_scope(span)?;
+        return Result::Ok(taken);
     }
 
     /// Whether the enum value at `place` is the variant `e` names, and each

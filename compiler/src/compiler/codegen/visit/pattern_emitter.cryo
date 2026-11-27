@@ -35,6 +35,7 @@ import compiler::codegen::llvm_types::{
     LBasicBlock, LIntPredicate, LRealPredicate, LType, LTypeKind, LValue
 };
 import compiler::codegen::util::{ CodegenUtil };
+import compiler::codegen::visit::ir_generator::{ IRGeneratorVisitor };
 import compiler::resolver::intern_table::{ InternTable };
 import compiler::resolver::res::{ DefId, Res, ResSlot };
 import compiler::types::arena::{ TypeArena };
@@ -408,7 +409,7 @@ type struct PatternEmitter {
     /// prefix differs.  On return the builder is positioned at whichever
     /// block emitted the last test (always terminated); the caller is free to
     /// reposition to `next_bb` for the following arm.
-    emit_match_arm_comparison(mut &this, arm: MatchArmNode*,
+    emit_match_arm_comparison(mut &this, visitor: mut IRGeneratorVisitor*, arm: MatchArmNode*,
             arm_bb: LBasicBlock, next_bb: LBasicBlock,
             minfo: MatchSubjectInfo, is_string_subj: boolean,
             subject: LValue, current_fn: LValue,
@@ -450,11 +451,15 @@ type struct PatternEmitter {
             mut handled: boolean = false;
             match (pat.kind) {
                 PatternKind::Literal(lit) => {
-                    // For string subjects, build the pattern as a global string
-                    // pointer and compare via strcmp; `lower_scalar_literal`
-                    // lowers every literal to an integer and would compare
-                    // pointer bits, not content.
-                    if (is_string_subj) {
+                    // A pattern the type check gave a test of its own (a
+                    // string pattern against a subject of another type) is
+                    // taken by that test.  For string subjects, build the
+                    // pattern as a global string pointer and compare via
+                    // strcmp; `lower_scalar_literal` lowers every literal to
+                    // an integer and would compare pointer bits, not content.
+                    if (lit.equals != null) {
+                        cmp = this.literal_pattern_test(visitor, lit, minfo, subject);
+                    } else if (is_string_subj) {
                         const pat_text: string = this.cg.resolve(lit.value);
                         const pat_val: LValue = this.cg.str_cache.get_or_create(
                             pat_text, pat_text.length() as i64, &this.cg.llvm_module);
@@ -550,6 +555,31 @@ type struct PatternEmitter {
         if (tail.is_valid() && !tail.has_terminator()) {
             this.cg.builder.build_br(next_bb);
         }
+    }
+
+    /// The value of `lit`'s own test, `subject == <the converted literal>`:
+    /// the subject is bound to the local the test reads, its place when the
+    /// subject value is one, else a slot it is stored into, and the test is
+    /// evaluated as any expression is.
+    literal_pattern_test(mut &this, visitor: mut IRGeneratorVisitor*, lit: LiteralPattern*,
+                         minfo: MatchSubjectInfo, subject: LValue) -> LValue {
+        if (!subject.is_valid()) { return LValue::null(); }
+        mut slot: LValue = subject;
+        const value_type: mut void* = llvm::LLVMTypeOf(subject.raw);
+        const subject_t: Type* = this.cg.arena_type(minfo.subject_ty);
+        const holds_address: boolean = subject_t != null
+            && (subject_t.kind == TypeKind::Pointer || subject_t.kind == TypeKind::Reference);
+        const is_place: boolean = value_type != null && LType::kind_of(value_type) == LTypeKind::Pointer
+            && !holds_address;
+        if (!is_place) {
+            const vty: LType = this.cg.type_mapper.map_type(minfo.subject_ty);
+            if (!vty.is_valid()) { return LValue::null(); }
+            slot = this.cg.flow.temp_slot(vty, "match.text");
+            if (!slot.is_valid()) { return LValue::null(); }
+            this.cg.builder.build_store(subject, slot);
+        }
+        this.cg.values.set(lit.subject, slot);
+        return visitor.dispatch.codegen_rvalue(visitor, lit.equals);
     }
 
     // Switch dispatch

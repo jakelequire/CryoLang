@@ -74,7 +74,7 @@ import compiler::ast::expression::{
 import compiler::ast::node::{ ProgramNode };
 import compiler::ast::node_locator::{ annotation_span };
 import compiler::ast::pattern::{
-    ConstantPattern, EnumPattern, MatchArmNode, Pattern, PatternKind, StaticMatchArmNode
+    ConstantPattern, EnumPattern, LiteralPattern, MatchArmNode, Pattern, PatternKind, StaticMatchArmNode
 };
 import compiler::ast::statement::{
     AsmBlockStmt, AsmOperand, BlockStmt, DeclStmt, DoWhileStmt, ExprStmt, ForStmt, IfStmt,
@@ -1470,7 +1470,71 @@ type struct SemaVisitor {
         }
         this.patterns.check_match_exhaustive(node.subject, subject_type, node.arms, stmt.span);
         this.patterns.check_duplicate_default_arm(node.arms);
+        this.resolve_text_patterns(node.arms, subject_type);
         this.patterns.check_literal_patterns(node.arms, subject_type);
+    }
+
+    /// Give each string pattern of `arms` whose subject, of `subject_type`,
+    /// is not a `string` the test that takes its arm: the subject `==` the
+    /// literal converted to the subject's type, the pattern declaring that
+    /// type for it as a typed binding does (`convert_where_declared`).  The
+    /// `==` is resolved as a written one between two values of the type is,
+    /// so the type's `Eq` answers it.  The subject is read through a local
+    /// of its own, which the match binds to it where the patterns are
+    /// tested, so it is evaluated once.  A literal that does not convert is
+    /// left without a test, for `check_literal_patterns` to refuse.
+    resolve_text_patterns(mut &this, arms: &[mut MatchArmNode*], subject_type: TypeRef) -> void {
+        if (!subject_type.is_valid()) { return; }
+        const subject: Type* = this.arena.lookup(subject_type);
+        if (subject == null || subject.is_error() || subject.kind == TypeKind::String) { return; }
+        const name: SymbolStr = this.intern.intern("__cryo_match_subject");
+        mut subject_sym: SymbolID = SymbolID::invalid();
+        // The test is typed on its own, not as the value the match is.
+        const outer_expected: TypeRef = this.state.expected_type;
+        this.state.expected_type = TypeRef::invalid();
+        for (mut i: i64 = 0; i < arms.length(); i++) {
+            const arm: MatchArmNode* = arms[i];
+            if (arm == null) { continue; }
+            for (mut j: i64 = 0; j < arm.patterns.length(); j++) {
+                mut pat: mut Pattern* = arm.patterns[j];
+                if (pat == null) { continue; }
+                const lit: mut LiteralPattern* = match (pat.kind) {
+                    PatternKind::Literal(l) => { l }
+                    _                       => { null }
+                };
+                if (lit == null || lit.literal_kind != LiteralKind::String) { continue; }
+                const span: SourceSpan = pat.span;
+                mut text: mut ExpressionNode* = ExpressionNode::literal(this.intern.resolve(lit.value), LiteralKind::String, span);
+                text.generated = true;
+                const text_type: TypeRef = this.resolve_expr(text);
+                mut converted: mut ExpressionNode* = null;
+                match (this.convert_where_declared(text, text_type, subject_type)) {
+                    TraitConversionOutcome::Converted(c) => { converted = c; }
+                    TraitConversionOutcome::Refused      => { pat.has_error = true; }
+                    TraitConversionOutcome::Mismatch     => { }
+                }
+                if (converted == null) { continue; }
+                if (!subject_sym.is_valid()) { subject_sym = this.resolver.alloc_synthetic_binding(); }
+                const save: i64 = this.scopes.save_scope();
+                this.scopes.declare(subject_sym, subject_type, false);
+                mut reference: mut ExpressionNode* = ExpressionNode::identifier_expr(name, span);
+                ExpressionNode::identifier_of(reference).set_res(Res::Local(subject_sym));
+                reference.generated = true;
+                const op: Token = Token::new(TokenType::EqualEqual, "==", span.start_line as int, span.start_col as int);
+                mut equals: mut ExpressionNode* = ExpressionNode::binary_expr(op, reference, converted, span);
+                equals.generated = true;
+                const result: TypeRef = this.resolve_expr(equals);
+                this.scopes.restore_scope(save);
+                const result_type: Type* = if (result.is_valid()) { this.arena.lookup(result) } else { null };
+                if (result_type == null || result_type.kind != TypeKind::Bool) {
+                    // The `==` reported why the subject's type cannot answer it.
+                    pat.has_error = true;
+                    continue;
+                }
+                lit.set_equals(equals, subject_sym);
+            }
+        }
+        this.state.expected_type = outer_expected;
     }
 
     visit_static_match_stmt(mut &this, stmt: Stmt*, node: mut StaticMatchStmt*) -> void {
@@ -5404,6 +5468,7 @@ type struct SemaVisitor {
         if (result_was_generic) { result_type = result_value.resolved_type; }
         this.state.expected_type = outer_expected;
         this.patterns.check_match_exhaustive(match_expr.subject, subject_type, match_expr.arms, e.span);
+        this.resolve_text_patterns(match_expr.arms, subject_type);
         this.patterns.check_literal_patterns(match_expr.arms, subject_type);
         return result_type;
     }
