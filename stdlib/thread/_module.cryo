@@ -67,7 +67,23 @@
 ///!   // both threads are joined here; `total` holds 3
 ///!   ```
 ///!
-///! The handle never leaves the scope's body: it may only be a `&Scope` /
+///! `s.spawn` returns a `ScopedJoinHandle<T>`, whose `join` hands back the
+///! thread's result, so a scoped thread can compute a value from what it
+///! borrows. A handle not joined is joined by the scope:
+///!
+///!   ```cryo
+///!   const values: [i64] = [1, 2, 3, 4];
+///!   const total: i64 = thread::scope((s: mut &thread::Scope) -> i64 {
+///!       const left = s.spawn(() -> i64 { return values[0] + values[1]; });
+///!       const right = s.spawn(() -> i64 { return values[2] + values[3]; });
+///!       return left.join().unwrap() + right.join().unwrap();   // 10
+///!   });
+///!   ```
+///!
+///! A panic that a handle's `join` returned is the caller's; the scope
+///! panics only for a scoped thread whose panic no `join` took.
+///!
+///! The scope's handle never leaves the scope's body: it may only be a `&Scope` /
 ///! `mut &Scope` local or parameter, or be used by a closure written without
 ///! `move`, and it is not `Send`, so a scoped thread cannot spawn through it.
 ///!
@@ -715,34 +731,171 @@ public function sleep(duration: Duration) -> void {
 // Scoped threads: fork-join parallelism with auto-join at scope end.
 // ---------------------------------------------------------------------------
 
+/// The part of a scoped thread's control block that does not depend on its
+/// result type: what the scope keeps of every thread it spawned. It must be
+/// the first field of `ScopedShared<T>`, since `release` is handed this
+/// header's address and reads it as the whole block.
+///
+/// Two actors hold the block, the scope and the thread's handle, and the
+/// last of them to let go frees it, so a handle kept after the scope ended
+/// reads a block that is still there. The thread itself holds no reference:
+/// it stores its outcome and sets `finished`, and touches the block no more.
+private type struct ScopedHeader {
+    /// `STATE_LIVE` until the thread has stored its outcome, then
+    /// `STATE_THREAD_DONE`.
+    private finished:   Atomic<u8>;
+    /// Set by whichever actor waits for the OS thread itself, so the thread
+    /// is joined exactly once; the other actor waits on `finished`.
+    private claimed:    Atomic<u8>;
+    /// 2 while both the scope and the handle hold the block.
+    private references: Atomic<u8>;
+    /// Set when the handle's `join` moved the outcome out.
+    private taken:      Atomic<u8>;
+    /// Whether the body panicked; written before `finished`.
+    private panicked:   boolean;
+    private tid:        u64;
+    /// Release the outcome when nothing took it, then free the block.
+    private release:    (mut u8*) -> void;
+}
+
+/// A scoped thread's control block: the header, then the outcome its body
+/// left and the copy of a panic's message, as `Shared<T>` holds them.
+private type struct ScopedShared<T> {
+    private header:        ScopedHeader;
+    private outcome:       Result<T, PanicInfo>;
+    private panic_message: [u8; 1024];
+}
+
+/// A scoped thread's heap input: its body and its control block, consumed
+/// by the thread as it starts.
+private type struct ScopedPayload<F, T> {
+    private body:   F;
+    private shared: mut ScopedShared<T>*;
+}
+
 /// Scoped-thread body: moves the body out of its box, frees the box, runs
-/// the body, and answers whether it panicked. Scoped bodies return no value,
-/// so there is no result/handshake machinery: the answer is the thread's
-/// exit value, which `Scope::join_all` reads. The gated `scope_trampoline`
-/// wrappers adapt the C entry ABI.
-private function scope_body<F>(arg: mut u8*) -> boolean where F: () -> void {
+/// the body, stores its outcome and marks the block finished. Nothing on
+/// this thread reads the block after that store. The gated
+/// `scope_trampoline` wrappers adapt the C entry ABI.
+private function scope_body<F, T>(arg: mut u8*) -> void where F: () -> T {
+    const p: ScopedPayload<F, T>* = arg as ScopedPayload<F, T>*;
+    const shared: mut ScopedShared<T>* = (*p).shared;
+    const rptr: mut Result<T, PanicInfo>* = &(*shared).outcome;
     // A take, as in `thread_body`: the box is released raw right after, so
     // `body` is the only owner of what it captured.
     unsafe {
-        const body: F = *(arg as F*);
+        const body: F = (*p).body;
         mut alloc: GlobalAllocator = GlobalAllocator::new();
-        alloc.deallocate(NonNull::new(arg), Layout::of::<F>());
-        return run_body::<F, void>(body).is_err();
+        alloc.deallocate(NonNull::new(arg), Layout::of::<ScopedPayload<F, T>>());
+        match (run_body::<F, T>(body)) {
+            Result::Ok(value) => {
+                (*shared).header.panicked = false;
+                *rptr = Result::Ok(value);
+            }
+            Result::Err(info) => {
+                const message: string = copy_panic_message(info.msg, &(*shared).panic_message[0]);
+                (*shared).header.panicked = true;
+                *rptr = Result::Err(PanicInfo { msg: message, file: info.file, line: info.line });
+            }
+        }
     }
+    (*shared).header.finished.store(STATE_THREAD_DONE, MemoryOrder::Release);
 }
 
-/// A scoped thread's exit value when its body panicked; 0 when it returned.
-private const SCOPED_THREAD_PANICKED: u64 = 1;
-
 ![target(unix)]
-private function scope_trampoline<F>(arg: mut u8*) -> u8* where F: () -> void {
-    if (scope_body::<F>(arg)) { return SCOPED_THREAD_PANICKED as u8*; }
+private function scope_trampoline<F, T>(arg: mut u8*) -> u8* where F: () -> T {
+    scope_body::<F, T>(arg);
     return null;
 }
 ![target(windows)]
-private function scope_trampoline<F>(arg: mut u8*) -> u32 where F: () -> void {
-    if (scope_body::<F>(arg)) { return SCOPED_THREAD_PANICKED as u32; }
+private function scope_trampoline<F, T>(arg: mut u8*) -> u32 where F: () -> T {
+    scope_body::<F, T>(arg);
     return 0;
+}
+
+/// Wait until the scoped thread of `header` has stored its outcome. The
+/// first actor to ask joins the OS thread; a second, which can only ask once
+/// the first has started, waits for the store the first one's join ends
+/// after.
+private function finish_scoped(header: mut ScopedHeader*) -> void {
+    if ((*header).claimed.swap(1, MemoryOrder::AcqRel) == 0) {
+        os_join((*header).tid);
+    }
+    while ((*header).finished.load(MemoryOrder::Acquire) != STATE_THREAD_DONE) { os_yield(); }
+}
+
+/// Let go of one actor's hold on a scoped block; the last one releases the
+/// outcome the handle did not take and frees the block.
+private function let_go_scoped(header: mut ScopedHeader*) -> void {
+    if ((*header).references.fetch_subtract(1, MemoryOrder::AcqRel) != 1) { return; }
+    const release: (mut u8*) -> void = (*header).release;
+    release(header as mut u8*);
+}
+
+/// The `release` of a `ScopedShared<T>`: drop the outcome unless the handle
+/// moved it out, then free the block.
+private function release_scoped<T>(block: mut u8*) -> void {
+    const shared: mut ScopedShared<T>* = block as mut ScopedShared<T>*;
+    if ((*shared).header.taken.load(MemoryOrder::Acquire) == 0) {
+        pointer::drop_in_place::<Result<T, PanicInfo>>(&(*shared).outcome);
+    }
+    mut alloc: GlobalAllocator = GlobalAllocator::new();
+    alloc.deallocate(NonNull::new(block), Layout::of::<ScopedShared<T>>());
+}
+
+/// Handle to a thread spawned through a `Scope`: `join` waits for it and
+/// hands back its body's result. A handle not joined is joined by the scope
+/// when its body returns, and the result is released then. The handle may
+/// outlive the scope; joining it after the scope ended returns the result
+/// the scope already waited for.
+public type struct ScopedJoinHandle<T> {
+    private shared: mut ScopedShared<T>*;
+
+    /// Block until the thread finishes. Returns `Ok` with the body's result,
+    /// or `Err` with the panic that ended it, as `JoinHandle::join` does. A
+    /// panic taken here is the caller's: the scope does not panic for it.
+    /// Consumes the handle.
+    public join(mut this) -> Result<T, PanicInfo> {
+        const { shared }: ScopedJoinHandle<T> = this;
+        const header: mut ScopedHeader* = &(*shared).header;
+        finish_scoped(header);
+        const rptr: Result<T, PanicInfo>* = &(*shared).outcome;
+        // Destructive read: `taken` tells the block's last release not to
+        // drop the outcome again, and a panic's message is copied out before
+        // the block can be freed.
+        unsafe {
+            const outcome: Result<T, PanicInfo> = *rptr;
+            (*header).taken.store(1, MemoryOrder::Release);
+            match (outcome) {
+                Result::Ok(value) => {
+                    let_go_scoped(header);
+                    return Result::Ok(value);
+                }
+                Result::Err(info) => {
+                    const message: string = copy_panic_message(info.msg, &joined_panic_message[0]);
+                    let_go_scoped(header);
+                    return Result::Err(PanicInfo { msg: message, file: info.file, line: info.line });
+                }
+            }
+        }
+    }
+
+    /// True once the thread has finished running its body. Does not
+    /// consume the handle and never blocks.
+    public is_finished(&this) -> boolean {
+        return (*this.shared).header.finished.load(MemoryOrder::Acquire) != STATE_LIVE;
+    }
+}
+
+/// Dropping a handle without `join` leaves the thread to the scope, which
+/// joins it when its body returns. `join` destructures `this`, suppressing
+/// this path.
+implement<T> trait Drop for struct ScopedJoinHandle<T> {
+    drop(mut &this) -> void {
+        if (this.shared == null) { return; }
+        let_go_scoped(&(*this.shared).header);
+        this.shared = null;
+    }
 }
 
 /// Run `body` with a thread scope and join every thread it spawned through
@@ -751,7 +904,7 @@ private function scope_trampoline<F>(arg: mut u8*) -> u32 where F: () -> void {
 /// `body` still joins them, when the scope is released. When a scoped
 /// thread panicked, `scope` panics once it has joined them all.
 public function scope<F, R>(body: F) -> R where F: (mut &Scope) -> R {
-    mut s: Scope = Scope { tids: [] };
+    mut s: Scope = Scope { threads: [] };
     const result: R = body(&s);
     s.join_all();
     return result;
@@ -762,39 +915,62 @@ public function scope<F, R>(body: F) -> R where F: (mut &Scope) -> R {
 /// may borrow what outlives the scope's body.
 ![language("thread_scope")]
 public type struct Scope {
-    private tids: [u64];
+    private threads: [mut ScopedHeader*];
 
-    /// Spawn a scoped thread running `body()`; `body` is moved into it. The
-    /// thread is recorded and joined before `thread::scope` returns. Panics
-    /// on allocation or thread-creation failure. `F: Send` holds for a
-    /// closure written without `move` when everything it borrows is `Sync`;
-    /// a deny-listed type (`Rc`, a lock guard, the scope itself) is not.
-    public spawn<F>(mut &this, body: F) -> void
-    where F: () -> void + Send {
+    /// Spawn a scoped thread running `body()`; `body` is moved into it, and
+    /// the handle returned hands back its `T`. The thread is recorded and
+    /// joined before `thread::scope` returns, whether or not its handle is
+    /// joined. Panics on allocation or thread-creation failure. `F: Send`
+    /// holds for a closure written without `move` when everything it
+    /// borrows is `Sync`; a deny-listed type (`Rc`, a lock guard, the scope
+    /// itself) is not.
+    public spawn<F, T>(mut &this, body: F) -> ScopedJoinHandle<T>
+    where F: () -> T + Send, T: Send {
         mut alloc: GlobalAllocator = GlobalAllocator::new();
-        mut p: mut F* = null;
-        match (alloc.allocate(Layout::of::<F>())) {
-            Result::Ok(raw) => { p = raw.cast::<F>().as_pointer(); }
+        mut shared: mut ScopedShared<T>* = null;
+        match (alloc.allocate(Layout::of::<ScopedShared<T>>())) {
+            Result::Ok(raw) => { shared = raw.cast::<ScopedShared<T>>().as_pointer(); }
             Result::Err(_)  => { panic("Scope::spawn: alloc failed", intrinsics::location()); }
         }
-        *p = body;
-        match (os_create_thread(scope_trampoline::<F> as void*, p as u8*, 0)) {
-            Result::Ok(tid) => { this.tids.push(tid); }
+        (*shared).header.finished   = Atomic::<u8>::new(STATE_LIVE);
+        (*shared).header.claimed    = Atomic::<u8>::new(0);
+        (*shared).header.references = Atomic::<u8>::new(2);
+        (*shared).header.taken      = Atomic::<u8>::new(0);
+        (*shared).header.panicked   = false;
+        (*shared).header.tid        = 0;
+        (*shared).header.release    = release_scoped::<T>;
+        mut p: mut ScopedPayload<F, T>* = null;
+        match (alloc.allocate(Layout::of::<ScopedPayload<F, T>>())) {
+            Result::Ok(raw) => { p = raw.cast::<ScopedPayload<F, T>>().as_pointer(); }
+            Result::Err(_)  => { panic("Scope::spawn: alloc failed", intrinsics::location()); }
+        }
+        (*p).body   = body;
+        (*p).shared = shared;
+        match (os_create_thread(scope_trampoline::<F, T> as void*, p as u8*, 0)) {
+            Result::Ok(tid) => {
+                (*shared).header.tid = tid;
+                this.threads.push(&(*shared).header);
+                return ScopedJoinHandle::<T> { shared: shared };
+            }
             Result::Err(_)  => { panic("Scope::spawn: thread creation failed", intrinsics::location()); }
         }
     }
 
     /// Join every thread spawned so far, blocking until all have
-    /// finished, then panic if any of them panicked; each reported its own
-    /// panic when it did. Idempotent: clears the recorded set, so a later
-    /// drop/join is a no-op.
+    /// finished, then panic if any of them panicked and no handle's `join`
+    /// took that panic; each reported its own panic when it did.
+    /// Idempotent: clears the recorded set, so a later drop/join is a
+    /// no-op.
     public join_all(mut &this) -> void {
-        const n: i64 = this.tids.length() as i64;
+        const n: i64 = this.threads.length() as i64;
         mut panicked: boolean = false;
         for (mut i: i64 = 0; i < n; i = i + 1) {
-            if (os_join(this.tids[i]) == SCOPED_THREAD_PANICKED) { panicked = true; }
+            const header: mut ScopedHeader* = this.threads[i];
+            finish_scoped(header);
+            if ((*header).panicked && (*header).taken.load(MemoryOrder::Acquire) == 0) { panicked = true; }
+            let_go_scoped(header);
         }
-        this.tids.clear();
+        this.threads.clear();
         if (panicked) {
             panic("thread::scope: a scoped thread panicked", intrinsics::location());
         }

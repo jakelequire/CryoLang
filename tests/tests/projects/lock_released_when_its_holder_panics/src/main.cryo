@@ -1,0 +1,34 @@
+namespace LockReleasedWhenItsHolderPanics;
+
+import std::core::intrinsics;
+import std::sync::mutex::{ Mutex };
+import std::sync::read_write_lock::{ ReadWriteLock };
+import std::fmt;
+import std::thread;
+
+// No lock is poisoned: a thread that panics holding a guard releases the lock
+// as it unwinds, and the next holder sees what it wrote before the panic.
+function main() -> i32 {
+    const counter: Mutex<i64> = Mutex::<i64>::new(5);
+    const table: ReadWriteLock<i64> = ReadWriteLock::<i64>::new(1);
+    thread::scope((s: mut &thread::Scope) -> void {
+        const writer = s.spawn(() -> i64 {
+            mut guard = counter.lock();
+            *guard.as_mutable_pointer() = 7;
+            intrinsics::panic("gave up holding the mutex", intrinsics::location());
+            return 0;
+        });
+        fmt::println(f"mutex holder panicked: {writer.join().is_err()}");
+        const rewriter = s.spawn(() -> i64 {
+            const _guard = table.write();
+            intrinsics::panic("gave up holding the write lock", intrinsics::location());
+            return 0;
+        });
+        fmt::println(f"write-lock holder panicked: {rewriter.join().is_err()}");
+    });
+    fmt::println(f"mutex free: {counter.try_lock().is_some()}");
+    mut guard = counter.lock();
+    fmt::println(f"mutex value: {*guard.as_mutable_pointer()}");
+    fmt::println(f"write lock free: {table.try_write().is_some()}");
+    return 0;
+}

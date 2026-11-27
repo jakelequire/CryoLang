@@ -1,0 +1,64 @@
+namespace ThreadScopeSpawnReturnsAHandle;
+
+import std::collections::string::{ String };
+import std::core::intrinsics;
+import std::core::panic_unwind::{ catch_unwind, PanicInfo };
+import std::core::result::{ Result };
+import std::fmt;
+import std::thread;
+
+function sum(values: &[i64], from: i64, to: i64) -> i64 {
+    mut total: i64 = 0;
+    for (mut i: i64 = from; i < to; i++) { total = total + values[i]; }
+    return total;
+}
+
+// A panic the handle's `join` took is the caller's, so the scope returns.
+function taken_panic() -> i32 {
+    const said: String = thread::scope((s: mut &thread::Scope) -> String {
+        const handle = s.spawn(() -> i64 { intrinsics::panic("the joined thread gave up", intrinsics::location()); return 0; });
+        match (handle.join()) {
+            Result::Ok(_) => { return String::from("no panic"); }
+            Result::Err(info) => { return String::from(info.msg); }
+        }
+    });
+    fmt::println(f"taken: {said}");
+    return 0;
+}
+
+// A panic whose handle was dropped unjoined is the scope's to report.
+function untaken_panic() -> i32 {
+    thread::scope((s: mut &thread::Scope) -> void {
+        const _handle = s.spawn(() -> i64 { intrinsics::panic("the dropped thread gave up", intrinsics::location()); return 0; });
+    });
+    return 0;
+}
+
+function main() -> i32 {
+    // Two halves summed on two scoped threads that borrow `values`.
+    const values: [i64] = [1, 2, 3, 4, 5, 6, 7, 8];
+    const total: i64 = thread::scope((s: mut &thread::Scope) -> i64 {
+        const left = s.spawn(() -> i64 { return sum(&values, 0, 4); });
+        const right = s.spawn(() -> i64 { return sum(&values, 4, 8); });
+        return left.join().unwrap() + right.join().unwrap();
+    });
+    fmt::println(f"total {total}");
+
+    // A handle returned out of the scope: the scope joined its thread, and
+    // the handle still holds the result, released by `join` here. The
+    // ignored handle's `String` is released by the scope.
+    const escaped: thread::ScopedJoinHandle<String> = thread::scope((s: mut &thread::Scope) -> thread::ScopedJoinHandle<String> {
+        s.spawn(() -> String { return String::from("ignored"); });
+        return s.spawn(() -> String { return String::from("kept past the scope"); });
+    });
+    fmt::println(f"finished {escaped.is_finished()}");
+    const text: String = escaped.join().unwrap();
+    fmt::println(f"escaped: {text}");
+
+    taken_panic();
+    match (catch_unwind(untaken_panic)) {
+        Result::Ok(_) => { fmt::println("untaken: the scope returned"); }
+        Result::Err(info) => { fmt::println(f"untaken: {info.msg}"); }
+    }
+    return 0;
+}
