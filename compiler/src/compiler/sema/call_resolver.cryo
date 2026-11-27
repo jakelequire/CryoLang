@@ -5524,6 +5524,9 @@ type struct CallResolver {
             if (this.arena.is_this_placeholder(param) || !this.symbolic.symbolic_param_in_scope(param.param_sym)) {
                 return true;
             }
+            // A head for every type with no where-clause gives the trait to
+            // every type, so to every copy of this body as well.
+            if (this.trait_checker().every_type_head_gives(subject, trait_def, args)) { return true; }
             if (args.length() == 0) { return this.binding.param_bounded_by(param, trait_def); }
             // A bound written without arguments leaves them to the
             // parameter's own implementation, which the clause's arguments
@@ -6761,6 +6764,10 @@ type struct CallResolver {
         if (inst.has_resolved_type()) { return; }
         const tmpl: const TemplateEntry* = this.ctx.generic_registry.template_of_type(inst.generic_base);
         if (tmpl == null || tmpl.param_syms.length() != inst.type_args.length()) { return; }
+        mut owner: TypeSubstitution = TypeSubstitution::empty();
+        for (mut pi: i64 = 0; pi < tmpl.param_syms.length(); pi++) {
+            owner.add(this.arena.create_generic_param(tmpl.param_syms[pi], SymbolStr::empty(), pi as u64), inst.type_args[pi]);
+        }
         for (mut bi: i64 = 0; bi < func.trait_bounds.length(); bi++) {
             const bound: &TraitBound = &func.trait_bounds[bi];
             mut arg: TypeRef = TypeRef::invalid();
@@ -6779,8 +6786,20 @@ type struct CallResolver {
             for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
                 const tref: &TraitRef = &bound.trait_refs[ri];
                 if (tref.path.length() == 0) { continue; }
+                // A bound whose arguments name the method's own parameters
+                // (`T: Borrow<Q>` on `contains<Q>`) is judged where the call
+                // binds them, by `check_method_call_bounds`.
+                mut args: [TypeRef] = [];
+                mut names_method_param: boolean = false;
+                for (mut ai: i64 = 0; ai < tref.argument_types.length(); ai++) {
+                    const written: TypeRef = owner.apply(tref.argument_types[ai], this.arena);
+                    if (this.symbolic.names_param_out_of_scope(written)) { names_method_param = true; }
+                    args.push(written);
+                }
+                if (names_method_param) { continue; }
                 const holds: boolean = if (param != null) {
                     this.binding.param_bounded_by(param, tref.definition())
+                        || this.trait_checker().every_type_head_gives(arg, tref.definition(), &args)
                 } else {
                     this.trait_checker().type_implements_trait(arg, tref.definition(), 0)
                 };

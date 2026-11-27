@@ -144,6 +144,15 @@ yet is recorded with the change that builds it, not here.
      value's implementation by identity: no new door, and no type named.
      One step only, never chained with a converter.  (Jake, the v1 freeze)
 
+729. **A head for every type with no `where` clause answers a bound on a
+     type parameter.**  In a generic body, a bound on the body's own
+     parameter (`T: Make<T>`) holds when an implementation for every type
+     with no `where` clause gives it at those arguments, as when a bound
+     of the body does; 656's "any type whose arguments it binds" includes
+     a type parameter.  A head with a `where` clause does not answer for a
+     parameter.  It answers bounds only: member lookup on a parameter is
+     unchanged.  (Jake, the v1 freeze)
+
 ### 2026-11-26
 
 725. **`Str`'s text methods take their text by value.**  `contains`,
