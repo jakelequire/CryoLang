@@ -53,7 +53,7 @@ function write_then_read_roundtrips() -> Result<(), TestError> {
     }
     mut buf: [u8; 8];
     mut got: i64 = 0;
-    match (c.read(&buf[0], 8)) {
+    match (c.read(&buf)) {
         Result::Ok(n) => { got = n; } Result::Err(_) => { return bail(Str::new("read failed")); }
     }
     const ok: boolean = bytes_eq(Slice::from_raw(&buf[0], got), Str::new("hello"));
@@ -73,7 +73,7 @@ function read_past_end_is_eof() -> Result<(), TestError> {
     // Cursor is at the end after writing; a read here must report EOF (0).
     mut buf: [u8; 4];
     mut got: i64 = 99;
-    match (c.read(&buf[0], 4)) {
+    match (c.read(&buf)) {
         Result::Ok(n) => { got = n; } Result::Err(_) => { return bail(Str::new("read failed")); }
     }
     return expect_equal(got, 0 as i64);
@@ -171,4 +171,38 @@ function into_inner_returns_written_bytes() -> Result<(), TestError> {
     match (expect_equal(taken_len, 3 as i64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
     match (expect_equal(emptied, 0 as i64)) { Result::Ok(_) => { } Result::Err(e) => { return Result::Err(e); } }
     return expect(ok, Str::new("into_inner should hand back 'abc'"));
+}
+
+![test]
+function read_fills_the_front_of_the_slice_it_is_given() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::new(Array::<u8>::new());
+    match (c.write(Str::new("hello"))) {
+        Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write failed")); }
+    }
+    match (c.seek(SeekFrom::Start(0))) {
+        Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("rewind failed")); }
+    }
+    mut buf: [u8; 8] = [46; 8];
+    const whole: mut &Slice<u8> = &buf;
+    const got: i64 = match (c.read(whole.subslice_mutable(2, 5))) {
+        Result::Ok(n) => { n } Result::Err(_) => { return bail(Str::new("read failed")); }
+    };
+    expect_equal(got, 3 as i64)?;
+    return expect(bytes_eq(whole.subslice(0, 8), Str::new("..hel...")), Str::new("only the sub-slice is written"));
+}
+
+![test]
+function read_exact_past_the_end_is_unexpected_eof() -> Result<(), TestError> {
+    mut c: Cursor = Cursor::new(Array::<u8>::new());
+    match (c.write(Str::new("ab"))) {
+        Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("write failed")); }
+    }
+    match (c.seek(SeekFrom::Start(0))) {
+        Result::Ok(_) => { } Result::Err(_) => { return bail(Str::new("rewind failed")); }
+    }
+    mut buf: [u8; 4];
+    return match (c.read_exact(&buf)) {
+        Result::Ok(_) => { bail(Str::new("a two-byte source filled four bytes")) }
+        Result::Err(e) => { expect(e.kind == IoErrorKind::UnexpectedEof, Str::new("short read_exact is UnexpectedEof")) }
+    };
 }

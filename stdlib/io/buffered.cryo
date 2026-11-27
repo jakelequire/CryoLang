@@ -52,9 +52,10 @@ public const DEFAULT_BUFFER_SIZE: i64 = 8192;
 private const BYTE_LF: u8 = 0x0A;
 
 /// Coalesces writes destined for `W` into larger flushes. The inner
-/// writer is borrowed via pointer; the caller owns it and drops it.
+/// writer is borrowed by reference; the caller owns it, and it must outlive
+/// this writer.
 public type struct BufferedWriter<W> where W: Write {
-    private writer: mut W*;
+    private writer: mut &W;
     private buffer: mut u8*;
     private capacity: i64;
     private length: i64;
@@ -65,7 +66,7 @@ public type struct BufferedWriter<W> where W: Write {
     /// The `W: Write` bound lives on construction; instance methods
     /// don't restate it since no `BufferedWriter<W>` can exist without
     /// having gone through here first.
-    public static new(writer: mut W*) -> BufferedWriter<W>
+    public static new(writer: mut &W) -> BufferedWriter<W>
     where W: Write {
         return BufferedWriter::with_capacity(writer, DEFAULT_BUFFER_SIZE);
     }
@@ -73,7 +74,7 @@ public type struct BufferedWriter<W> where W: Write {
     /// Wrap with an explicit buffer size. A `capacity` of zero or less is
     /// permitted but degenerate: no buffer is allocated and every write
     /// hits the sink directly. Panics on allocation failure.
-    public static with_capacity(writer: mut W*, capacity: i64) -> BufferedWriter<W>
+    public static with_capacity(writer: mut &W, capacity: i64) -> BufferedWriter<W>
     where W: Write {
         mut buffer: mut u8* = null;
         mut size: i64 = 0;
@@ -99,8 +100,8 @@ public type struct BufferedWriter<W> where W: Write {
     /// buffering (e.g., a direct `flush` on the underlying fd).
     /// Callers mutating through this must call `BufferedWriter::flush`
     /// first, or buffered bytes will land out of order.
-    public get_reference(&this) -> W* {
-        return this.writer;
+    public get_reference(&this) -> &W {
+        return &*this.writer;
     }
 
     /// Number of bytes currently buffered but not yet flushed.
@@ -197,13 +198,13 @@ public type struct LineWriter<W> {
 
     /// A writer over `writer` that flushes at the end of every line, with
     /// a buffer of the default size. `writer` must outlive it.
-    public static new(writer: mut W*) -> LineWriter<W>
+    public static new(writer: mut &W) -> LineWriter<W>
     where W: Write {
         return LineWriter::with_capacity(writer, DEFAULT_BUFFER_SIZE);
     }
 
     /// As `new`, with a buffer of `capacity` bytes.
-    public static with_capacity(writer: mut W*, capacity: i64) -> LineWriter<W>
+    public static with_capacity(writer: mut &W, capacity: i64) -> LineWriter<W>
     where W: Write {
         return LineWriter::<W> {
             inner: BufferedWriter::with_capacity(writer, capacity)
@@ -212,7 +213,7 @@ public type struct LineWriter<W> {
 
     /// The writer underneath; flush this one first before writing to it,
     /// or buffered bytes land out of order.
-    public get_reference(&this) -> W* {
+    public get_reference(&this) -> &W {
         return this.inner.get_reference();
     }
 
@@ -295,9 +296,10 @@ implement<W> trait Drop for struct LineWriter<W> {
 /// buffer. Transforms a stream of small reads into a few large ones
 /// and makes `read_line` fast: no per-byte syscall.
 ///
-/// Borrows the inner reader via pointer. Caller owns it.
+/// Borrows the inner reader by reference; the caller owns it, and it must
+/// outlive this reader.
 public type struct BufferedReader<R> where R: Read {
-    private reader: mut R*;
+    private reader: mut &R;
     private buffer: mut u8*;
     private capacity: i64;
     /// First unread byte in the buffer.
@@ -315,14 +317,14 @@ public type struct BufferedReader<R> where R: Read {
     ///     println(f"{text.as_str()}");
     /// }
     /// ```
-    public static new(reader: mut R*) -> BufferedReader<R>
+    public static new(reader: mut &R) -> BufferedReader<R>
     where R: Read {
         return BufferedReader::with_capacity(reader, DEFAULT_BUFFER_SIZE);
     }
 
     /// A reader with a buffer of `capacity` bytes. Panics when `capacity`
     /// is not positive.
-    public static with_capacity(reader: mut R*, capacity: i64) -> BufferedReader<R>
+    public static with_capacity(reader: mut &R, capacity: i64) -> BufferedReader<R>
     where R: Read {
         if (capacity <= 0) {
             panic("BufferedReader::with_capacity: capacity must be > 0", intrinsics::location());
@@ -346,8 +348,8 @@ public type struct BufferedReader<R> where R: Read {
 
     /// The reader underneath. Reading from it directly skips the bytes
     /// this `BufferedReader` has already buffered.
-    public get_reference(&this) -> R* {
-        return this.reader;
+    public get_reference(&this) -> &R {
+        return &*this.reader;
     }
 
     /// The size of the read buffer in bytes.
@@ -380,7 +382,7 @@ public type struct BufferedReader<R> where R: Read {
     /// many bytes are actually wanted, consume that many.
     public fill_buffer(mut &this) -> Result<&Slice<u8>, IoError> {
         if (this.position >= this.filled) {
-            const n: i64 = this.reader.read(this.buffer, this.capacity)?;
+            const n: i64 = this.reader.read(Slice::from_raw_mutable(this.buffer, this.capacity))?;
             this.position = 0;
             this.filled = n;
         }
@@ -431,21 +433,18 @@ where R: Read {
 
 implement<R> trait Read for struct BufferedReader<R>
 where R: Read {
-    read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
-        if (length < 0) {
-            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
-        }
+    read(mut &this, buffer: mut &Slice<u8>) -> Result<i64, IoError> {
         // Buffer empty and caller wants more than we'd hold anyway;
         // bypass the buffer to avoid the copy.
-        if (this.position >= this.filled && length >= this.capacity) {
-            return this.reader.read(buffer, length);
+        if (this.position >= this.filled && buffer.length() >= this.capacity) {
+            return this.reader.read(buffer);
         }
         const filled: &Slice<u8> = this.fill_buffer()?;
         mut n: i64 = filled.length();
-        if (n > length) { n = length; }
+        if (n > buffer.length()) { n = buffer.length(); }
         if (n > 0) {
             libc::memcpy(
-                buffer,
+                buffer.as_mutable_pointer(),
                 filled.as_pointer(),
                 n as u64
             );

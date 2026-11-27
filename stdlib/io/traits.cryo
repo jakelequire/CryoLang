@@ -49,24 +49,22 @@ private const BYTE_LF: u8 = 0x0A;
 /// implementation provides `read`; the rest (`read_to_end`,
 /// `read_to_string`, `read_line`, ...) are built on it.
 public type trait Read {
-    /// Fill up to `length` bytes starting at `buffer`. Returns the
-    /// number of bytes actually read. Zero means EOF; a value less
-    /// than `length` means the underlying source had no more bytes
+    /// Fill the front of `buffer`, up to all of it. Returns the number
+    /// of bytes actually read, which are `buffer`'s first ones. Zero
+    /// means EOF (or an empty `buffer`); a value less than
+    /// `buffer.length()` means the underlying source had no more bytes
     /// available at this moment (not necessarily EOF; callers decide
-    /// whether to retry). A negative `length` fails with `InvalidInput`.
-    read(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError>;
+    /// whether to retry).
+    read(mut &this, buffer: mut &Slice<u8>) -> Result<i64, IoError>;
 
-    /// Read until the buffer is full or the source returns 0 (EOF).
+    /// Read until `buffer` is full or the source returns 0 (EOF).
     /// Returns the total bytes read; short returns mean EOF reached.
-    /// Retries on `Interrupted`. A negative `length` fails with
-    /// `InvalidInput`.
-    read_all(mut &this, buffer: mut u8*, length: i64) -> Result<i64, IoError> {
-        if (length < 0) {
-            return Result::Err(IoError::new(IoErrorKind::InvalidInput, 0));
-        }
+    /// Retries on `Interrupted`.
+    read_all(mut &this, buffer: mut &Slice<u8>) -> Result<i64, IoError> {
+        const length: i64 = buffer.length();
         mut total: i64 = 0;
         while (total < length) {
-            match (this.read(buffer + total, length - total)) {
+            match (this.read(buffer.subslice_mutable(total, length))) {
                 Result::Ok(n) => {
                     if (n == 0) { return Result::Ok(total); }
                     total = total + n;
@@ -85,12 +83,12 @@ public type trait Read {
     /// Read a single byte. `None` means EOF: the source is empty
     /// and no more reads will yield data. Retries on `Interrupted`.
     read_byte(mut &this) -> Result<Option<u8>, IoError> {
-        mut byte: u8 = 0;
+        mut byte: [u8; 1];
         loop {
-            match (this.read(&byte, 1)) {
+            match (this.read(&byte)) {
                 Result::Ok(n) => {
                     if (n == 0) { return Result::Ok(Option::None); }
-                    return Result::Ok(Option::Some(byte));
+                    return Result::Ok(Option::Some(byte[0]));
                 }
                 Result::Err(err) => {
                     match (err.kind) {
@@ -141,7 +139,8 @@ public type trait Read {
         }
 
         mut continuation: [u8; 3];
-        this.read_exact(&continuation[0], needed)?;
+        const whole: mut &Slice<u8> = &continuation;
+        this.read_exact(whole.subslice_mutable(0, needed))?;
         mut i: i64 = 0;
         while (i < needed) {
             const byte: u8 = continuation[i];
@@ -185,13 +184,12 @@ public type trait Read {
         }
     }
 
-    /// Read exactly `length` bytes. A short read at EOF is a failure,
-    /// reported as `UnexpectedEof`. Use this when the caller knows the
-    /// precise number of bytes that must be present. A negative `length`
-    /// fails with `InvalidInput`.
-    read_exact(mut &this, buffer: mut u8*, length: i64) -> Result<(), IoError> {
-        const n: i64 = this.read_all(buffer, length)?;
-        if (n < length) {
+    /// Fill all of `buffer`. A short read at EOF is a failure, reported
+    /// as `UnexpectedEof`. Use this when the caller knows the precise
+    /// number of bytes that must be present.
+    read_exact(mut &this, buffer: mut &Slice<u8>) -> Result<(), IoError> {
+        const n: i64 = this.read_all(buffer)?;
+        if (n < buffer.length()) {
             return Result::Err(IoError::new(IoErrorKind::UnexpectedEof, 0));
         }
         return Result::Ok(());
@@ -207,13 +205,14 @@ public type trait Read {
     read_to_end(mut &this, out: mut &Array<u8>) -> Result<i64, IoError> {
         const start: i64 = out.length();
         mut scratch: [u8; READ_TO_END_CHUNK];
+        const chunk: mut &Slice<u8> = &scratch;
         loop {
-            match (this.read(&scratch[0], READ_TO_END_CHUNK)) {
+            match (this.read(chunk)) {
                 Result::Ok(n) => {
                     if (n == 0) {
                         return Result::Ok(out.length() - start);
                     }
-                    out.try_append(Slice::<u8>::from_raw(&scratch[0], n))?;
+                    out.try_append(chunk.subslice(0, n))?;
                 }
                 Result::Err(err) => {
                     match (err.kind) {
@@ -233,8 +232,9 @@ public type trait Read {
     read_to_string(mut &this, out: mut &String) -> Result<i64, IoError> {
         const start: i64 = out.length();
         mut scratch: [u8; READ_TO_END_CHUNK];
+        const chunk: mut &Slice<u8> = &scratch;
         loop {
-            match (this.read(&scratch[0], READ_TO_END_CHUNK)) {
+            match (this.read(chunk)) {
                 Result::Ok(n) => {
                     if (n == 0) {
                         const appended: Str = out.as_str().byte_substring(start, out.length());
@@ -246,7 +246,7 @@ public type trait Read {
                             }
                         }
                     }
-                    out.try_append(Str::from_raw(&scratch[0], n))?;
+                    out.try_append(Str::from(chunk.subslice(0, n)))?;
                 }
                 Result::Err(err) => {
                     match (err.kind) {
@@ -268,16 +268,16 @@ public type trait Read {
     /// from `io::buffered`; its `read_line` override is the fast path.
     read_line(mut &this, out: mut &String) -> Result<i64, IoError> {
         const start: i64 = out.length();
-        mut byte: u8 = 0;
+        mut byte: [u8; 1];
         loop {
-            match (this.read(&byte, 1)) {
+            match (this.read(&byte)) {
                 Result::Ok(n) => {
                     if (n == 0) { return Result::Ok(out.length() - start); }
                     // Append the RAW byte: `try_push(u8)` would format it as
                     // decimal text (that arm is for numeric display), which is
                     // never what a byte-level line reader wants.
-                    out.try_push_byte(byte)?;
-                    if (byte == BYTE_LF) {
+                    out.try_push_byte(byte[0])?;
+                    if (byte[0] == BYTE_LF) {
                         return Result::Ok(out.length() - start);
                     }
                 }
