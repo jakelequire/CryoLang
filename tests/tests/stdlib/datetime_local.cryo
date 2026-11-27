@@ -1,0 +1,94 @@
+///! The system's local UTC offset: `UtcOffset::local_at` gives a whole
+///! number of minutes less than a day, `DateTime::now_local` reads the
+///! current instant at it.  On Linux a `TZ` naming a fixed zone and one
+///! with daylight saving fixes the answer; on Windows the offset agrees
+///! with the difference between `GetLocalTime` and `GetSystemTime`.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::DateTimeLocal;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::env;
+import std::ffi::libc;
+import std::sys::syscall;
+import std::sys::syscall::{ SYSTEMTIME };
+import std::time::datetime::{ DateTime, UtcOffset };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect, expect_equal };
+
+/// 2024-01-15T12:00:00Z and 2024-07-15T12:00:00Z: either side of every
+/// northern and southern daylight-saving change.
+const JANUARY: i64 = 1705320000;
+const JULY: i64 = 1721044800;
+
+![test]
+function a_local_offset_is_whole_minutes_within_a_day() -> Result<(), TestError> {
+    const winter: UtcOffset = UtcOffset::local_at(JANUARY);
+    const summer: UtcOffset = UtcOffset::local_at(JULY);
+    expect(winter.seconds() % 60 == 0 && summer.seconds() % 60 == 0, "whole minutes")?;
+    expect(winter.seconds() > -86400 && winter.seconds() < 86400, "less than a day")?;
+    return expect(summer.seconds() > -86400 && summer.seconds() < 86400, "less than a day");
+}
+
+![test]
+function now_local_is_the_current_instant_at_the_local_offset() -> Result<(), TestError> {
+    const before: i64 = DateTime::now().unix_seconds();
+    const local: DateTime = DateTime::now_local();
+    const after: i64 = DateTime::now().unix_seconds();
+    // The same instant, whatever the offset it is read at.
+    expect(local.unix_seconds() >= before && local.unix_seconds() <= after, "the current instant")?;
+    expect(local.offset == UtcOffset::local_at(local.unix_seconds()), "read at the local offset")?;
+    return expect(UtcOffset::local() == UtcOffset::local_at(DateTime::now().unix_seconds()), "local is local_at of now");
+}
+
+![test]
+![target(linux)]
+function a_fixed_zone_in_tz_is_its_offset() -> Result<(), TestError> {
+    // Five hours west of UTC, with no daylight saving.
+    env::set_var("TZ", "EST5");
+    libc::tzset();
+    expect_equal(UtcOffset::local_at(JANUARY).seconds(), -18000)?;
+    expect_equal(UtcOffset::local_at(JULY).seconds(), -18000)?;
+    env::set_var("TZ", "IST-5:30");
+    libc::tzset();
+    return expect_equal(UtcOffset::local_at(JANUARY).seconds(), 19800);
+}
+
+![test]
+![target(linux)]
+function a_zone_with_daylight_saving_changes_with_the_date() -> Result<(), TestError> {
+    env::set_var("TZ", "EST5EDT,M3.2.0,M11.1.0");
+    libc::tzset();
+    expect_equal(UtcOffset::local_at(JANUARY).seconds(), -18000)?;
+    expect_equal(UtcOffset::local_at(JULY).seconds(), -14400)?;
+    const reading: DateTime = DateTime::from_unix_seconds(JULY).to_offset(UtcOffset::local_at(JULY));
+    return expect_equal(reading.hour, 8);
+}
+
+/// The seconds a UTC timestamp of `t`'s reading would count, to the minute.
+![target(windows)]
+function minutes_of(t: &SYSTEMTIME) -> i64 {
+    const civil: DateTime = DateTime::from_parts(t.wYear as i64, t.wMonth as u32, t.wDay as u32,
+        t.wHour as u32, t.wMinute as u32, 0, 0, UtcOffset::utc()).unwrap();
+    return civil.unix_seconds();
+}
+
+![test]
+![target(windows)]
+function the_offset_is_the_systems_local_less_universal_time() -> Result<(), TestError> {
+    mut universal: SYSTEMTIME = SYSTEMTIME {
+        wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0, wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
+    };
+    mut local: SYSTEMTIME = universal;
+    // Read both inside one minute: retry when the minute turned between.
+    for (mut attempt: i32 = 0; attempt < 3; attempt++) {
+        syscall::GetSystemTime(&universal);
+        syscall::GetLocalTime(&local);
+        mut again: SYSTEMTIME = universal;
+        syscall::GetSystemTime(&again);
+        if (again.wMinute == universal.wMinute) { break; }
+    }
+    const expected: i64 = minutes_of(&local) - minutes_of(&universal);
+    return expect_equal(UtcOffset::local().seconds() as i64, expected);
+}

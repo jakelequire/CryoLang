@@ -5,7 +5,11 @@
 ///! hour / minute / second / nanosecond - together with the `UtcOffset` it
 ///! was read at. It is a pure value: POD, copy-by-value, no `Drop`. One
 ///! made from a Unix timestamp or a `SystemTime` is read at UTC; `to_offset`
-///! reads the same instant at another offset.
+///! reads the same instant at another offset. The system's local offset at
+///! an instant is `UtcOffset::local_at` (now, `UtcOffset::local`), as the
+///! operating system's time zone settings give it, and `DateTime::now_local`
+///! reads the current instant at it. Named zones and their rules (a time
+///! zone database) are not part of the standard library.
 ///!
 ///! The timestamp <-> civil-date conversion uses Howard Hinnant's public
 ///! `civil_from_days` / `days_from_civil` algorithms, which are exact and
@@ -44,6 +48,8 @@ import std::fmt::display::{ Debug, Display, Formatter };
 import std::fmt::error::{ FormatError };
 import std::time::clock::{ SystemTime };
 import std::time::duration::{ Duration };
+import std::ffi::libc::{ localtime_r, tm };
+import std::sys::syscall::{ FILETIME, SYSTEMTIME };
 
 private const SECONDS_PER_DAY:  i64 = 86400;
 private const SECONDS_PER_HOUR: i64 = 3600;
@@ -112,6 +118,42 @@ public type struct UtcOffset with [Eq, Debug] {
     /// `Z`.
     public is_utc(&this) -> boolean {
         return this.seconds == 0;
+    }
+
+    /// The offset of the system's local time zone at the instant
+    /// `unix_seconds` seconds after the Unix epoch, daylight saving
+    /// included, as the operating system's time zone settings give it.  An
+    /// offset that is not a whole number of minutes (a zone's historical
+    /// local mean time) is rounded to the nearest minute, which is what RFC
+    /// 3339 can write; an instant the system cannot place answers UTC.
+    public static local_at(unix_seconds: i64) -> UtcOffset {
+        return match (local_wall_seconds(unix_seconds)) {
+            Option::Some(wall) => { UtcOffset::nearest_minute(wall - unix_seconds) }
+            Option::None => { UtcOffset::utc() }
+        };
+    }
+
+    /// The offset of the system's local time zone now: `local_at` of the
+    /// current time.
+    public static local() -> UtcOffset {
+        return UtcOffset::local_at(DateTime::now().unix_seconds());
+    }
+
+    /// `seconds` east of UTC rounded to the nearest whole minute, half a
+    /// minute away from zero; UTC for a span of a day or more, which no
+    /// zone has.
+    private static nearest_minute(seconds: i64) -> UtcOffset {
+        if (seconds <= -SECONDS_PER_DAY || seconds >= SECONDS_PER_DAY) { return UtcOffset::utc(); }
+        const half: i64 = SECONDS_PER_MINUTE / 2;
+        const rounded: i64 = if (seconds < 0) {
+            -((-seconds + half) / SECONDS_PER_MINUTE) * SECONDS_PER_MINUTE
+        } else {
+            ((seconds + half) / SECONDS_PER_MINUTE) * SECONDS_PER_MINUTE
+        };
+        return match (UtcOffset::from_seconds(rounded as i32)) {
+            Option::Some(offset) => { offset }
+            Option::None => { UtcOffset::utc() }
+        };
     }
 }
 
@@ -205,6 +247,14 @@ public type struct DateTime {
     public static now() -> DateTime {
         const t: SystemTime = SystemTime::now();
         return DateTime::from_system_time(&t);
+    }
+
+    /// The current instant read at the system's local offset
+    /// (`UtcOffset::local_at` of it): the wall-clock reading a local clock
+    /// shows, with the offset that places it.
+    public static now_local() -> DateTime {
+        const utc: DateTime = DateTime::now();
+        return utc.to_offset(UtcOffset::local_at(utc.unix_seconds()));
     }
 
     /// Read RFC 3339 `date-time` text: `1985-04-12T23:20:50.52Z`,
@@ -410,6 +460,52 @@ private function days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     const doy: i64 = (153 * shifted_month + 2) / 5 + (day as i64) - 1;           // [0, 365]
     const doe: i64 = yoe * 365 + yoe / 4 - yoe / 100 + doy;                     // [0, 146096]
     return era * DAYS_PER_ERA + doe - DAYS_SHIFT;
+}
+
+/// The local wall-clock reading at the instant `unix_seconds`, as the
+/// seconds a UTC timestamp of the same reading would count: what the C
+/// library's `localtime_r` gives, which applies the zone's rules (the `TZ`
+/// variable or the system's zone) for that date.  `None` when it cannot
+/// place the instant.
+![target(linux)]
+private function local_wall_seconds(unix_seconds: i64) -> Option<i64> {
+    mut instant: i64 = unix_seconds;
+    mut fields: tm = tm {
+        tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 0, tm_mon: 0, tm_year: 0,
+        tm_wday: 0, tm_yday: 0, tm_isdst: 0, tm_gmtoff: 0, tm_zone: null,
+    };
+    if (localtime_r(&instant, &fields) == null) { return Option::None; }
+    const days: i64 = days_from_civil(fields.tm_year as i64 + 1900, (fields.tm_mon + 1) as u32, fields.tm_mday as u32);
+    return Option::Some(days * SECONDS_PER_DAY + fields.tm_hour as i64 * SECONDS_PER_HOUR
+        + fields.tm_min as i64 * SECONDS_PER_MINUTE + fields.tm_sec as i64);
+}
+
+/// The local wall-clock reading at the instant `unix_seconds`, as the
+/// seconds a UTC timestamp of the same reading would count:
+/// `SystemTimeToTzSpecificLocalTime` of the instant under the system's
+/// current time zone, which applies that zone's daylight-saving rule for
+/// the instant's date.  `None` before 1601, where a `FILETIME` starts, or
+/// when the system cannot place the instant.
+![target(windows)]
+private function local_wall_seconds(unix_seconds: i64) -> Option<i64> {
+    // A FILETIME counts 100-nanosecond intervals from 1601-01-01 UTC.
+    const SECONDS_FROM_1601_TO_1970: i64 = 11644473600;
+    const INTERVALS_PER_SECOND: i64 = 10000000;
+    const since_1601: i64 = unix_seconds + SECONDS_FROM_1601_TO_1970;
+    if (since_1601 < 0 || since_1601 > i64::MAX / INTERVALS_PER_SECOND) { return Option::None; }
+    const intervals: i64 = since_1601 * INTERVALS_PER_SECOND;
+    const instant: FILETIME = FILETIME {
+        dwLowDateTime: (intervals & 0xFFFFFFFF) as u32, dwHighDateTime: (intervals >> 32) as u32,
+    };
+    mut universal: SYSTEMTIME = SYSTEMTIME {
+        wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0, wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0,
+    };
+    if (syscall::FileTimeToSystemTime(&instant, &universal) == 0) { return Option::None; }
+    mut local: SYSTEMTIME = universal;
+    if (syscall::SystemTimeToTzSpecificLocalTime(null, &universal, &local) == 0) { return Option::None; }
+    const days: i64 = days_from_civil(local.wYear as i64, local.wMonth as u32, local.wDay as u32);
+    return Option::Some(days * SECONDS_PER_DAY + local.wHour as i64 * SECONDS_PER_HOUR
+        + local.wMinute as i64 * SECONDS_PER_MINUTE + local.wSecond as i64);
 }
 
 /// (year, month, day) for a day index counted from the Unix epoch, packed

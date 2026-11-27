@@ -1,0 +1,66 @@
+///! `SocketAddress::parse` reads the text `Display` writes - `a.b.c.d:port`
+///! and `[v6]:port` - back into the same endpoint, and refuses each other
+///! form with what was wrong: no port, an IPv6 address without brackets,
+///! a bad address, a port past 65535 or not a number.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::NetSocketAddressParse;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::core::convert::{ ConversionError };
+import std::net::address::ip::{ IpAddress, IpV4Address, IpV6Address };
+import std::net::address::socket_address::{ SocketAddress };
+import std::test::error::{ TestError };
+import std::test::assert::{ bail, expect, expect_equal };
+
+/// `text` parsed and written back.
+function round_trip(text: Str) -> Result<(), TestError> {
+    return match (SocketAddress::parse(text)) {
+        Result::Ok(address) => {
+            const shown: String = f"{address}";
+            expect(shown.as_str() == text, text)
+        }
+        Result::Err(error) => { bail(error.describe()) }
+    };
+}
+
+/// `text` refused with `reason`.
+function refused(text: Str, reason: Str) -> Result<(), TestError> {
+    return match (SocketAddress::parse(text)) {
+        Result::Ok(_) => { bail(text) }
+        Result::Err(error) => { expect(error.describe() == reason, error.describe()) }
+    };
+}
+
+![test]
+function the_displayed_forms_read_back() -> Result<(), TestError> {
+    round_trip("127.0.0.1:8080")?;
+    round_trip("0.0.0.0:0")?;
+    round_trip("[::1]:443")?;
+    round_trip("[2001:db8::1]:65535")?;
+    const parsed: SocketAddress = SocketAddress::parse("10.1.2.3:80").unwrap();
+    expect_equal(parsed.port, 80)?;
+    return expect(parsed.ip.is_ipv4(), "an IPv4 endpoint");
+}
+
+![test]
+function an_ipv6_endpoint_holds_its_address() -> Result<(), TestError> {
+    const parsed: SocketAddress = SocketAddress::parse("[::1]:9000").unwrap();
+    expect_equal(parsed.port, 9000)?;
+    return expect(parsed.ip.is_ipv6(), "an IPv6 endpoint");
+}
+
+![test]
+function other_forms_are_refused_with_the_reason() -> Result<(), TestError> {
+    refused("127.0.0.1", "a socket address is written `address:port`")?;
+    refused("::1:8080", "an IPv6 socket address is written `[address]:port`")?;
+    refused("[::1]8080", "an IPv6 socket address is written `[address]:port`")?;
+    refused("[::1", "an IPv6 socket address is written `[address]:port`")?;
+    refused("[1.2.3.4]:80", "invalid IPv6 address")?;
+    refused("256.0.0.1:80", "invalid IPv4 address")?;
+    refused("1.2.3.4:65536", "the port is not a number from 0 to 65535")?;
+    refused("1.2.3.4:http", "the port is not a number from 0 to 65535")?;
+    return refused("1.2.3.4:", "the port is not a number from 0 to 65535");
+}

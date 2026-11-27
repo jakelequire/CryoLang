@@ -1,0 +1,99 @@
+///! HMAC (RFC 2104) over SHA-256 and SHA-1 against the published test
+///! vectors: RFC 4231's for HMAC-SHA-256 and RFC 2202's for HMAC-SHA-1,
+///! each with a key shorter than a block and one longer, which is hashed
+///! first.  A message fed in pieces authenticates as the same message held
+///! whole, and `verify` accepts the right code and refuses a code one bit
+///! off, one cut short, and the code of another key.
+
+![config(testing)]
+namespace CryoTests::Tests::Stdlib::HashHmac;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::collections::array::{ Array };
+import std::hash::{ HmacSha1, HmacSha256, Sha1Digest, Sha256Digest };
+import std::test::error::{ TestError };
+import std::test::assert::{ expect };
+
+const HI_THERE: Str = "Hi There";
+const JEFE: Str = "Jefe";
+const WHAT_DO_YA_WANT: Str = "what do ya want for nothing?";
+const LARGE_KEY_FIRST: Str = "Test Using Larger Than Block-Size Key - Hash Key First";
+
+/// `count` copies of `byte`.
+function repeated(byte: u8, count: i64) -> Array<u8> {
+    mut bytes: Array<u8> = Array::<u8>::with_capacity(count);
+    for (mut i: i64 = 0; i < count; i++) { bytes.push(byte); }
+    return bytes;
+}
+
+function check_256(code: &Sha256Digest, want: Str) -> Result<(), TestError> {
+    const got: String = code.to_hex();
+    return expect(got.as_str() == want, want);
+}
+
+function check_1(code: &Sha1Digest, want: Str) -> Result<(), TestError> {
+    const got: String = code.to_hex();
+    return expect(got.as_str() == want, want);
+}
+
+![test]
+function hmac_sha256_matches_rfc_4231() -> Result<(), TestError> {
+    // Test case 1: a 20-byte key of 0x0b.
+    const key_one: Array<u8> = repeated(0x0b, 20);
+    check_256(&HmacSha256::mac(&key_one, HI_THERE.as_bytes()),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7")?;
+    // Test case 2: a key shorter than the code.
+    check_256(&HmacSha256::mac(JEFE.as_bytes(), WHAT_DO_YA_WANT.as_bytes()),
+        "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")?;
+    // Test case 6: a 131-byte key, longer than a block, hashed first.
+    const key_long: Array<u8> = repeated(0xaa, 131);
+    return check_256(&HmacSha256::mac(&key_long, LARGE_KEY_FIRST.as_bytes()),
+        "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+}
+
+![test]
+function hmac_sha1_matches_rfc_2202() -> Result<(), TestError> {
+    const key_one: Array<u8> = repeated(0x0b, 20);
+    check_1(&HmacSha1::mac(&key_one, HI_THERE.as_bytes()),
+        "b617318655057264e28bc0b6fb378c8ef146be00")?;
+    check_1(&HmacSha1::mac(JEFE.as_bytes(), WHAT_DO_YA_WANT.as_bytes()),
+        "effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")?;
+    // An 80-byte key, longer than a block, hashed first.
+    const key_long: Array<u8> = repeated(0xaa, 80);
+    return check_1(&HmacSha1::mac(&key_long, LARGE_KEY_FIRST.as_bytes()),
+        "aa4ae5e15272d00e95705637ce8a3b55ed402112");
+}
+
+![test]
+function a_message_in_pieces_authenticates_as_held_whole() -> Result<(), TestError> {
+    const key: Str = "key";
+    const message: Str = "The quick brown fox jumps over the lazy dog";
+    const whole: Sha256Digest = HmacSha256::mac(key.as_bytes(), message.as_bytes());
+    check_256(&whole, "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")?;
+    mut pieces: HmacSha256 = HmacSha256::new(key.as_bytes());
+    pieces.update(message.byte_substring(0, 4).as_bytes());
+    pieces.update(message.byte_substring(4, 20).as_bytes());
+    pieces.update(message.byte_substring(20, message.length()).as_bytes());
+    const streamed: Sha256Digest = pieces.finish();
+    return expect(streamed == whole, "the streamed code is the one-shot code");
+}
+
+![test]
+function verify_refuses_any_other_code() -> Result<(), TestError> {
+    const key: Str = "secret";
+    const other_key: Str = "other";
+    const data: Str = "payload";
+    const code: Sha256Digest = HmacSha256::mac(key.as_bytes(), data.as_bytes());
+    expect(HmacSha256::verify(key.as_bytes(), data.as_bytes(), code.as_bytes()), "the right code")?;
+    mut flipped: Array<u8> = Array::<u8>::new();
+    for (byte in code.as_bytes().iter()) { flipped.push(byte); }
+    flipped[31] = flipped[31] ^ 1;
+    expect(!HmacSha256::verify(key.as_bytes(), data.as_bytes(), &flipped), "one bit off")?;
+    expect(!HmacSha256::verify(key.as_bytes(), data.as_bytes(), code.as_bytes().subslice(0, 31)), "one byte short")?;
+    const other: Sha256Digest = HmacSha256::mac(other_key.as_bytes(), data.as_bytes());
+    expect(!HmacSha256::verify(key.as_bytes(), data.as_bytes(), other.as_bytes()), "another key's code")?;
+    const sha1_code: Sha1Digest = HmacSha1::mac(key.as_bytes(), data.as_bytes());
+    return expect(HmacSha1::verify(key.as_bytes(), data.as_bytes(), sha1_code.as_bytes()), "the right SHA-1 code");
+}

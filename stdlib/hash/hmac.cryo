@@ -1,0 +1,172 @@
+///! hmac: keyed message authentication codes (RFC 2104) over SHA-256 and
+///! SHA-1.
+///!
+///! `HmacSha256` (`HmacSha1`) authenticates a message that arrives in
+///! pieces - `new(key)`, `update`, then `finish` - or one held whole
+///! (`mac`), giving the code as a `Sha256Digest` (`Sha1Digest`).  `verify`
+///! recomputes a code and compares it with one received in time that does
+///! not depend on where they differ, which is how a received code must be
+///! checked: comparing with `==` stops at the first different byte and
+///! tells a caller how much of a forgery was right.
+///!
+///! ```cryo
+///! import std::hash::{ HmacSha256, Sha256Digest };
+///!
+///! const key: Str = "key";
+///! const message: Str = "The quick brown fox jumps over the lazy dog";
+///! const tag: Sha256Digest = HmacSha256::mac(key.as_bytes(), message.as_bytes());
+///! // tag.to_hex() == "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+///! ```
+
+namespace std::hash::hmac;
+
+import std::core::slice::{ Slice };
+import std::hash::sha1::{ Sha1, Sha1Digest };
+import std::hash::sha256::{ Sha256, Sha256Digest };
+
+/// The block both SHA-1 and SHA-256 compress, in bytes: the length a key
+/// is padded or hashed to.
+private const BLOCK_LENGTH: i64 = 64;
+/// The byte XORed into the key for the inner hash.
+private const INNER_PAD: u8 = 0x36;
+/// The byte XORed into the key for the outer hash.
+private const OUTER_PAD: u8 = 0x5C;
+
+/// A key as the block HMAC pads: the key's own bytes followed by zeros,
+/// or, for a key longer than a block, the hash of it followed by zeros.
+private type struct KeyBlock {
+    private bytes: [u8; 64];
+
+    /// The block holding `bytes`, a key no longer than a block or the hash
+    /// of a longer one, followed by zeros.
+    static of(bytes: &Slice<u8>) -> KeyBlock {
+        mut block: KeyBlock = KeyBlock { bytes: [0; 64] };
+        for (mut i: i64 = 0; i < bytes.length(); i++) {
+            block.bytes[i] = bytes[i];
+        }
+        return block;
+    }
+
+    /// Whether `key` is longer than a block, and so is hashed first.
+    static needs_hashing(key: &Slice<u8>) -> boolean {
+        return key.length() > BLOCK_LENGTH;
+    }
+
+    /// The block with each byte XORed with `pad`.
+    padded(&this, pad: u8) -> [u8; 64] {
+        mut out: [u8; 64] = [0; 64];
+        for (mut i: i64 = 0; i < BLOCK_LENGTH; i++) {
+            out[i] = this.bytes[i] ^ pad;
+        }
+        return out;
+    }
+
+    /// Whether `a` and `b` hold the same bytes, in time that depends on
+    /// their lengths alone: every byte is compared, whatever the first
+    /// difference.
+    static same_in_constant_time(a: &Slice<u8>, b: &Slice<u8>) -> boolean {
+        if (a.length() != b.length()) { return false; }
+        mut difference: u8 = 0;
+        for (mut i: i64 = 0; i < a.length(); i++) {
+            difference = difference | (a[i] ^ b[i]);
+        }
+        return difference == 0;
+    }
+}
+
+/// HMAC-SHA-256 (RFC 2104 over FIPS 180-4), computed over a message that
+/// arrives in pieces.  Any key length is accepted; one longer than 64
+/// bytes is hashed first, as the RFC says.
+public type struct HmacSha256 {
+    private inner: Sha256;
+    private outer_key: [u8; 64];
+
+    /// A code under `key` over the empty message.
+    public static new(key: &Slice<u8>) -> HmacSha256 {
+        const block: KeyBlock = if (KeyBlock::needs_hashing(key)) {
+            KeyBlock::of(Sha256::digest(key).as_bytes())
+        } else {
+            KeyBlock::of(key)
+        };
+        const inner_key: [u8; 64] = block.padded(INNER_PAD);
+        mut inner: Sha256 = Sha256::new();
+        inner.update(inner_key.as_slice());
+        return HmacSha256 { inner: inner, outer_key: block.padded(OUTER_PAD) };
+    }
+
+    /// The code under `key` of `data`, a message held whole.
+    public static mac(key: &Slice<u8>, data: &Slice<u8>) -> Sha256Digest {
+        mut code: HmacSha256 = HmacSha256::new(key);
+        code.update(data);
+        return code.finish();
+    }
+
+    /// Whether `tag` is the code under `key` of `data`, compared in time
+    /// that does not depend on where a wrong `tag` differs.
+    public static verify(key: &Slice<u8>, data: &Slice<u8>, tag: &Slice<u8>) -> boolean {
+        const expected: Sha256Digest = HmacSha256::mac(key, data);
+        return KeyBlock::same_in_constant_time(expected.as_bytes(), tag);
+    }
+
+    /// Append `data` to the message.
+    public update(mut &this, data: &Slice<u8>) -> void {
+        this.inner.update(data);
+    }
+
+    /// The code of the message fed so far.
+    public finish(mut this) -> Sha256Digest {
+        const inner_digest: Sha256Digest = this.inner.finish();
+        mut outer: Sha256 = Sha256::new();
+        outer.update(this.outer_key.as_slice());
+        outer.update(inner_digest.as_bytes());
+        return outer.finish();
+    }
+}
+
+/// HMAC-SHA-1 (RFC 2104 over RFC 3174), for protocols that name it.  Its
+/// shape is `HmacSha256`'s; it gives a `Sha1Digest`.
+public type struct HmacSha1 {
+    private inner: Sha1;
+    private outer_key: [u8; 64];
+
+    /// A code under `key` over the empty message.
+    public static new(key: &Slice<u8>) -> HmacSha1 {
+        const block: KeyBlock = if (KeyBlock::needs_hashing(key)) {
+            KeyBlock::of(Sha1::digest(key).as_bytes())
+        } else {
+            KeyBlock::of(key)
+        };
+        const inner_key: [u8; 64] = block.padded(INNER_PAD);
+        mut inner: Sha1 = Sha1::new();
+        inner.update(inner_key.as_slice());
+        return HmacSha1 { inner: inner, outer_key: block.padded(OUTER_PAD) };
+    }
+
+    /// The code under `key` of `data`, a message held whole.
+    public static mac(key: &Slice<u8>, data: &Slice<u8>) -> Sha1Digest {
+        mut code: HmacSha1 = HmacSha1::new(key);
+        code.update(data);
+        return code.finish();
+    }
+
+    /// Whether `tag` is the code under `key` of `data`, compared in time
+    /// that does not depend on where a wrong `tag` differs.
+    public static verify(key: &Slice<u8>, data: &Slice<u8>, tag: &Slice<u8>) -> boolean {
+        const expected: Sha1Digest = HmacSha1::mac(key, data);
+        return KeyBlock::same_in_constant_time(expected.as_bytes(), tag);
+    }
+
+    /// Append `data` to the message.
+    public update(mut &this, data: &Slice<u8>) -> void {
+        this.inner.update(data);
+    }
+
+    /// The code of the message fed so far.
+    public finish(mut this) -> Sha1Digest {
+        const inner_digest: Sha1Digest = this.inner.finish();
+        mut outer: Sha1 = Sha1::new();
+        outer.update(this.outer_key.as_slice());
+        outer.update(inner_digest.as_bytes());
+        return outer.finish();
+    }
+}

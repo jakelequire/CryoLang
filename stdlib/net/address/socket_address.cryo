@@ -1,15 +1,15 @@
 ///! SocketAddress: (IP, port).
 ///!
-///! Used everywhere a listener binds or a client connects. `parse_v4`
-///! accepts `a.b.c.d:port`. The bracketed `[v6]:port` form has no
-///! parser here: read the address with `IpV6Address::parse` and pair it
-///! with the port through `new`.
+///! Used everywhere a listener binds or a client connects. `parse` reads
+///! the text `Display` writes, `a.b.c.d:port` or `[v6]:port`; `parse_v4`
+///! reads the first form alone, answering only whether it parsed.
 
 namespace std::net::address::socket_address;
 
 import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::convert;
+import std::core::convert::{ ConversionError };
 import std::collections::str::{ Str };
 import std::net::address::ip::{ IpAddress, IpV4Address, IpV6Address };
 import std::fmt::display::{ Debug, Display, Formatter };
@@ -23,9 +23,9 @@ import std::fmt::error::{ FormatError };
 /// import std::net::address::ip::{ IpAddress, IpV6Address };
 /// import std::net::address::socket_address::{ SocketAddress };
 ///
-/// const v4: SocketAddress = SocketAddress::parse_v4(Str::new("127.0.0.1:8080")).unwrap();
+/// const v4: SocketAddress = SocketAddress::parse("127.0.0.1:8080").unwrap();
 /// const v6: SocketAddress = SocketAddress::new(IpAddress::V6(IpV6Address::localhost()), 8080);
-/// // v4.port == 8080; v6 prints as `[::1]:8080`
+/// // v4.port == 8080; v6 prints as `[::1]:8080`, which `parse` reads back
 /// ```
 public type struct SocketAddress {
     public ip: IpAddress;
@@ -65,6 +65,54 @@ public type struct SocketAddress {
         return SocketAddress {
             ip: IpAddress::V6(IpV6Address::localhost()),
             port: port
+        };
+    }
+
+    /// Parse an endpoint in the form `Display` writes: `a.b.c.d:port`, or
+    /// an IPv6 address in brackets with the port after them, `[::1]:8080`
+    /// (RFC 3986).  The port is a decimal number from 0 to 65535.  Refused,
+    /// with what was wrong, when the text has neither form, its address
+    /// does not parse, an IPv6 address is not in brackets, or the port is
+    /// not such a number.
+    public static parse(source: Str) -> Result<SocketAddress, ConversionError> {
+        mut address: Str = source;
+        mut port_text: Str = source;
+        mut ip: Option<IpAddress> = Option::None;
+        if (source.starts_with("[")) {
+            match (source.split_once("]:")) {
+                Option::Some(parts) => {
+                    address = parts.first.byte_substring(1, parts.first.length());
+                    port_text = parts.second;
+                }
+                Option::None => {
+                    return Result::Err(ConversionError::new("an IPv6 socket address is written `[address]:port`"));
+                }
+            }
+            match (IpV6Address::parse_opt(address)) {
+                Option::Some(v6) => { ip = Option::Some(IpAddress::V6(v6)); }
+                Option::None => { return Result::Err(ConversionError::new("invalid IPv6 address")); }
+            }
+        } else {
+            match (source.split_once_from_end(":")) {
+                Option::Some(parts) => {
+                    address = parts.first;
+                    port_text = parts.second;
+                }
+                Option::None => {
+                    return Result::Err(ConversionError::new("a socket address is written `address:port`"));
+                }
+            }
+            if (address.find_byte(0x3A).is_some()) {
+                return Result::Err(ConversionError::new("an IPv6 socket address is written `[address]:port`"));
+            }
+            match (IpV4Address::parse_opt(address)) {
+                Option::Some(v4) => { ip = Option::Some(IpAddress::V4(v4)); }
+                Option::None => { return Result::Err(ConversionError::new("invalid IPv4 address")); }
+            }
+        }
+        return match (u16::try_from(port_text)) {
+            Result::Ok(port) => { Result::Ok(SocketAddress { ip: ip.unwrap(), port: port }) }
+            Result::Err(_) => { Result::Err(ConversionError::new("the port is not a number from 0 to 65535")) }
         };
     }
 
