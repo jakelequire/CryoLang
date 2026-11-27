@@ -1,0 +1,66 @@
+///! A local an `async` function carries across an `await` is reached through
+///! its field in every later state, including where it is passed as a trait
+///! object: the conversion to `virtual &Trait` views the value it is given,
+///! so the mention inside it is rewritten like any other.  An f-string passed
+///! as `fmt::Arguments` is converted the same way, to its pieces as a
+///! `virtual &FormatPieces`.
+
+![config(testing)]
+namespace CryoTests::Tests::Lang::AsyncCarriedLocalAsTraitObject;
+
+import std::core::result::{ Result };
+import std::collections::str::{ Str };
+import std::future;
+import std::fmt;
+import std::fmt::{ Arguments, FormatWrite };
+import std::test::assert::{ expect_equal };
+import std::test::error::{ TestError };
+
+type trait Named {
+    name_length(&this) -> i64;
+}
+
+type struct Person {
+    name: String;
+}
+
+implement trait Named for struct Person {
+    name_length(&this) -> i64 { return this.name.length(); }
+}
+
+function measure(value: virtual &Named) -> i64 {
+    return value.name_length();
+}
+
+function render(text: Arguments) -> String {
+    mut out: String = String::new();
+    const _: Result<(), fmt::FormatError> = out.write(text);
+    return out;
+}
+
+async function seven() -> i64 {
+    return 7;
+}
+
+async function measured_after_an_await() -> i64 {
+    const person: Person = Person { name: String::from("ada") };
+    const n: i64 = await seven();
+    return measure(&person) + n;
+}
+
+async function rendered_after_an_await() -> String {
+    const name: String = String::from("ada");
+    const n: i64 = await seven();
+    return render(f"{name} {n}");
+}
+
+![test]
+function carried_local_passed_as_a_trait_object() -> Result<(), TestError> {
+    return expect_equal(future::block_on(measured_after_an_await()), 10);
+}
+
+![test]
+function carried_local_in_an_fstring_passed_as_arguments() -> Result<(), TestError> {
+    const text: String = future::block_on(rendered_after_an_await());
+    return expect_equal(text.as_str(), Str::new("ada 7"));
+}

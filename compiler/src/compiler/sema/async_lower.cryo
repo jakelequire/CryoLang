@@ -56,7 +56,7 @@ import compiler::ast::declaration::{
 import compiler::ast::expression::{
     ArrayAccessExpr, ArrayExpr, AwaitExpr, BinaryExpr, CallExpr,
     CastExpr, DeleteExpr, ExpressionNode, FieldInit, IdentifierExpr, IfExpr,
-    LambdaExpr, MatchExpr, MemberAccessExpr, NewExpr,
+    LambdaExpr, MatchExpr, MemberAccessExpr, NewExpr, ObjectConversionExpr,
     ScopeResolutionExpr, StaticMatchExpr, StructExpr, TernaryExpr,
     TryExpr, TupleExpr, TypeofExpr, UnaryExpr
 };
@@ -985,6 +985,11 @@ type struct AsyncLower {
             this.rewrite_returns_expr(rr_cast.expression, poll_out, span);
             return;
         }
+        const rr_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (rr_object != null) {
+            this.rewrite_returns_expr(rr_object.operand, poll_out, span);
+            return;
+        }
         const rr_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (rr_aa != null) {
             this.rewrite_returns_expr(rr_aa.array, poll_out, span);
@@ -1076,6 +1081,10 @@ type struct AsyncLower {
         const count_cast: CastExpr* = ExpressionNode::cast_of(e);
         if (count_cast != null) {
             return this.expr_await_count(count_cast.expression);
+        }
+        const count_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (count_object != null) {
+            return this.expr_await_count(count_object.operand);
         }
         const count_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (count_aa != null) {
@@ -1618,6 +1627,10 @@ type struct AsyncLower {
         if (read_cast != null) {
             return this.name_read_in_expr(read_cast.expression, key);
         }
+        const read_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (read_object != null) {
+            return this.name_read_in_expr(read_object.operand, key);
+        }
         const read_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (read_aa != null) {
             return this.name_read_in_expr(read_aa.array, key) || this.name_read_in_expr(read_aa.index, key);
@@ -1974,6 +1987,14 @@ type struct AsyncLower {
         if (subst_cast != null) {
             subst_cast.expression = this.subst_name_expr(subst_cast.expression, key, field,
                                                          struct_ref, ty, span, by_value);
+            return e;
+        }
+        // A conversion to a trait object views its operand, a reference,
+        // and hands nothing over.
+        mut subst_object: mut ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (subst_object != null) {
+            subst_object.operand = this.subst_name_expr(subst_object.operand, key, field,
+                                                        struct_ref, ty, span, false);
             return e;
         }
         mut subst_aa: mut ArrayAccessExpr* = ExpressionNode::array_access_of(e);
@@ -4063,6 +4084,10 @@ type struct AsyncLower {
         if (edge_cast != null) {
             return this.expr_has_free_edge(edge_cast.expression, break_only);
         }
+        const edge_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (edge_object != null) {
+            return this.expr_has_free_edge(edge_object.operand, break_only);
+        }
         const edge_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (edge_aa != null) {
             return this.expr_has_free_edge(edge_aa.array, break_only)
@@ -4523,6 +4548,11 @@ type struct AsyncLower {
         const use_cast: CastExpr* = ExpressionNode::cast_of(e);
         if (use_cast != null) {
             this.mark_last_use_expr(use_cast.expression, key, by_value, out);
+            return;
+        }
+        const use_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (use_object != null) {
+            this.mark_last_use_expr(use_object.operand, key, false, out);
             return;
         }
         const use_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
@@ -5264,6 +5294,10 @@ type struct AsyncLower {
         if (addr_cast != null) {
             return this.frame_addr_root_expr(sm, addr_cast.expression);
         }
+        const addr_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (addr_object != null) {
+            return this.frame_addr_root_expr(sm, addr_object.operand);
+        }
         const root_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (root_aa != null) {
             const av: ExpressionNode* = this.frame_addr_root_expr(sm, root_aa.array);
@@ -5403,6 +5437,8 @@ type struct AsyncLower {
         if (un != null && un.op.kind == TokenType::Amp) { return this.owned_place_root(sm, un.operand); }
         const cast: CastExpr* = ExpressionNode::cast_of(e);
         if (cast != null) { return this.owned_place_root(sm, cast.expression); }
+        const object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (object != null) { return this.owned_place_root(sm, object.operand); }
         const ma: MemberAccessExpr* = ExpressionNode::member_access_of(e);
         if (ma != null) {
             if (this.names_through_indirection(ma.object)) { return null; }
@@ -6042,6 +6078,10 @@ type struct AsyncLower {
         if (clear_cast != null) {
             return this.await_transparent(clear_cast.expression);
         }
+        const clear_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (clear_object != null) {
+            return this.await_transparent(clear_object.operand);
+        }
         const tr_aa: ArrayAccessExpr* = ExpressionNode::array_access_of(e);
         if (tr_aa != null) {
             // An overloaded `[]` is a call, and a call is not transparent.
@@ -6191,6 +6231,11 @@ type struct AsyncLower {
         mut hoist_cast: mut CastExpr* = ExpressionNode::cast_of(e);
         if (hoist_cast != null) {
             hoist_cast.expression = this.hoist_expr(hoist_cast.expression, pre);
+            return e;
+        }
+        mut hoist_object: mut ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (hoist_object != null) {
+            hoist_object.operand = this.hoist_expr(hoist_object.operand, pre);
             return e;
         }
 
@@ -6504,6 +6549,11 @@ type struct AsyncLower {
         mut cast: mut CastExpr* = ExpressionNode::cast_of(e);
         if (cast != null) {
             cast.expression = this.anchor_borrowed(cast.expression, pre);
+            return e;
+        }
+        mut object: mut ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (object != null) {
+            object.operand = this.anchor_borrowed(object.operand, pre);
             return e;
         }
         return e;
@@ -6933,6 +6983,10 @@ type struct AsyncLower {
         if (rn_cast != null) {
             this.rn_expr(map, rn_cast.expression); return;
         }
+        const rn_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (rn_object != null) {
+            this.rn_expr(map, rn_object.operand); return;
+        }
         const sl: StructExpr* = ExpressionNode::struct_of(e);
         if (sl != null) {
             for (mut i: i64 = 0; i < sl.field_inits.length(); i++) {
@@ -7250,6 +7304,10 @@ type struct AsyncLower {
         const rb_cast: CastExpr* = ExpressionNode::cast_of(e);
         if (rb_cast != null) {
             this.rb_expr(ctx, rb_cast.expression); return;
+        }
+        const rb_object: ObjectConversionExpr* = ExpressionNode::object_conversion_of(e);
+        if (rb_object != null) {
+            this.rb_expr(ctx, rb_object.operand); return;
         }
         const sl: StructExpr* = ExpressionNode::struct_of(e);
         if (sl != null) {
