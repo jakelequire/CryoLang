@@ -1279,6 +1279,48 @@ public:
         return false;
     }
 
+    /// The number of type terms `ty` is written with: one for itself and the
+    /// count of each type it is made of - a pointee, a referent, an element,
+    /// a wrapped type, a tuple's members, a function's parameters and result,
+    /// an instantiation's arguments (a concrete copy's too), an object's
+    /// arguments, and what a resolved projection stands for.  A type made of
+    /// another is always larger than it, so a chain of questions each about
+    /// a smaller type than the one before ends.
+    term_size(&this, ty: TypeRef) -> i64 {
+        if (!ty.is_valid()) { return 0; }
+        const t: Type* = this.lookup(ty);
+        if (t == null) { return 0; }
+        if (t.kind == TypeKind::Pointer) { return 1 + this.term_size(t.as_pointer().pointee); }
+        if (t.kind == TypeKind::Reference) { return 1 + this.term_size(t.as_reference().referent); }
+        if (t.kind == TypeKind::Array) { return 1 + this.term_size(t.as_array().element); }
+        if (t.kind == TypeKind::Optional) { return 1 + this.term_size(t.as_optional().wrapped); }
+        if (t.kind == TypeKind::AssocProjection) {
+            const proj: AssocProjectionType* = t.as_assoc_projection();
+            if (proj.resolved_type.is_valid()) { return this.term_size(proj.resolved_type); }
+            return 1 + this.term_size(proj.base);
+        }
+        mut size: i64 = 1;
+        if (t.kind == TypeKind::Tuple) {
+            const tup: TupleType* = t.as_tuple();
+            for (mut i: i64 = 0; i < tup.elements.length(); i++) { size = size + this.term_size(tup.elements[i]); }
+            return size;
+        }
+        if (t.kind == TypeKind::Function) {
+            const func: FunctionType* = t.as_function();
+            size = size + this.term_size(func.return_type);
+            for (mut i: i64 = 0; i < func.param_types.length(); i++) { size = size + this.term_size(func.param_types[i]); }
+            return size;
+        }
+        if (t.kind == TypeKind::Object) {
+            const obj: ObjectType* = t.as_object();
+            for (mut i: i64 = 0; i < obj.args.length(); i++) { size = size + this.term_size(obj.args[i]); }
+            return size;
+        }
+        const count: i64 = this.inst_type_arg_count(ty);
+        for (mut i: i64 = 0; i < count; i++) { size = size + this.term_size(this.inst_type_arg_at(ty, i)); }
+        return size;
+    }
+
     /// Append to `out` each closure type within `ty` that borrows from the
     /// frame it was made in (`StructType.borrows_frame`): `ty` itself, or one
     /// reached through a type argument, a pointee, an element or a member of

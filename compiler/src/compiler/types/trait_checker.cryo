@@ -76,11 +76,15 @@ type struct TraitChecker {
     ///   2. If the impl has a `where T: Eq` clause, recursively verify
     ///      `X: Eq` with the impl's generic params bound to the
     ///      InstantiatedType's args.
-    /// `depth` guards against pathological loops in cyclic impl chains;
-    /// the depth limit is conservative (we don't expect realistic chains
-    /// past a handful of levels) and a depleted depth conservatively
-    /// returns false so an unsatisfiable bound never accidentally enables
-    /// body specialization.
+    /// `depth` counts the steps of the chain of questions that led here
+    /// whose subject was no smaller (`TypeArena::term_size`) than the type
+    /// that asked it: a pointee, an element, or a where-clause bound on a
+    /// type the subject is made of is a smaller question and is not counted,
+    /// so a chain as long as its type is deep (a wrapper per piece of an
+    /// interpolated string) is answered, while a cycle - the same question
+    /// again, or one about an ever larger type - spends the budget and
+    /// stops.  A spent budget returns false so an unsatisfiable bound never
+    /// enables body specialization.
     /// `trait_name` is the trait's IDENTITY (`TraitRef::identity()`, a
     /// stamped annotation, or `GenericRegistry::wellknown`), never a written
     /// leaf: the marker comparisons below are identity comparisons, and a leaf
@@ -90,7 +94,7 @@ type struct TraitChecker {
     /// asks both questions.
     type_implements_trait(&this, ty: TypeRef, trait_name: DefId, depth: i32) -> boolean {
         if (depth >= 16) {
-            // Depth budget exhausted on a deep or cyclic impl/where-clause
+            // Budget spent on a cyclic or ever-growing impl/where-clause
             // chain. Return false (unchanged) so an unsatisfiable bound never
             // accidentally enables body specialization - but surface a clean
             // diagnostic. Without this, the `false` propagates into
@@ -104,7 +108,7 @@ type struct TraitChecker {
             const tn: string = this.intern_table.shown(this.arena.defs.path_of(trait_name));
             this.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("trait-bound resolution exceeded the recursion limit (16) while checking `%s`; the impl or where-clause chain may be cyclic", tn)));
+                fmt::format("trait-bound resolution exceeded the recursion limit (16 steps to a type no smaller than the one before) while checking `%s`; the impl or where-clause chain may be cyclic", tn)));
             return false;
         }
 
@@ -153,7 +157,7 @@ type struct TraitChecker {
             const t_ptr: Type* = this.arena.lookup(ty);
             if (t_ptr != null && t_ptr.kind == TypeKind::Pointer) {
                 const pt: PointerType* = t_ptr.as_pointer();
-                return this.type_implements_trait(pt.pointee, trait_name, depth + 1);
+                return this.type_implements_trait(pt.pointee, trait_name, depth);
             }
 
             // A non-pointer `Copy` type owns no resources, so dropping it is a
@@ -176,7 +180,7 @@ type struct TraitChecker {
         // implementation of each holds exactly when the element's does.
         const array_t: Type* = this.arena.lookup(ty);
         if (array_t != null && array_t.kind == TypeKind::Array && this.answered_through_slice(trait_name)) {
-            return this.type_implements_trait(array_t.as_array().element, trait_name, depth + 1);
+            return this.type_implements_trait(array_t.as_array().element, trait_name, depth);
         }
 
         const object_t: Type* = this.arena.lookup(ty);
@@ -450,6 +454,14 @@ type struct TraitChecker {
         return shown;
     }
 
+    /// The subject of a bound written on a type, `subst` applied; invalid
+    /// for a bound on a parameter or a projection.
+    written_bound_subject(&this, bound: const TraitBound*, subst: TypeSubstitution*) -> TypeRef {
+        if (!bound.subject_type.is_valid()) { return TypeRef::invalid(); }
+        if (subst == null) { return bound.subject_type; }
+        return subst.apply(bound.subject_type, this.arena);
+    }
+
     /// The trait of `bound`, written on a type that is neither a parameter
     /// nor a projection (`where HighError: From<E>`, `where Wrapper<T>:
     /// Describe`), that its subject does not implement once `subst` binds
@@ -462,8 +474,7 @@ type struct TraitChecker {
     /// still names a parameter, which the copy that binds it decides.
     unmet_written_trait(&this, bound: const TraitBound*, subst: TypeSubstitution*, depth: i32,
                         out_subject: mut TypeRef*) -> const TraitRef* {
-        if (!bound.subject_type.is_valid()) { return null; }
-        const subject: TypeRef = if (subst != null) { subst.apply(bound.subject_type, this.arena) } else { bound.subject_type };
+        const subject: TypeRef = this.written_bound_subject(bound, subst);
         if (!subject.is_valid() || this.arena.contains_generic_param(subject)) { return null; }
         for (mut ri: i64 = 0; ri < bound.trait_refs.length(); ri++) {
             const tr: const TraitRef* = &bound.trait_refs[ri];
@@ -867,9 +878,9 @@ type struct TraitChecker {
                 const bound: const TraitBound* = &impl_block.where_bounds[bi];
                 if (!bound.subject_type.is_valid() && !impl_block.lends_param(bound.subject_param())) { return false; }
             }
-            return this.bounds_satisfied_at_depth(impl_block.where_bounds, null, depth + 1);
+            return this.bounds_satisfied_at_depth(impl_block.where_bounds, null, depth, subject);
         }
-        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &bindings, depth + 1);
+        return this.bounds_satisfied_at_depth(impl_block.where_bounds, &bindings, depth, subject);
     }
 
     /// Bind the parameters `impl_block`'s head writes in the arguments of
@@ -1082,13 +1093,17 @@ type struct TraitChecker {
 
     /// `bounds_satisfied` with explicit recursion depth, used by
     /// `type_implements_trait` so the recursive chain shares a single
-    /// depth budget.
+    /// depth budget.  `asking` is the type whose implementation wrote the
+    /// bounds: a bound on a smaller type asks at `depth`, any other at one
+    /// more (`step_depth`).
     bounds_satisfied_at_depth(&this, bounds: &[TraitBound],
-                               subst: TypeSubstitution*, depth: i32) -> boolean {
+                               subst: TypeSubstitution*, depth: i32, asking: TypeRef) -> boolean {
         if (bounds.length() == 0) { return true; }
         mut unmet_subject: TypeRef = TypeRef::invalid();
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
-            if (this.unmet_written_trait(&bounds[bi], subst, depth, &unmet_subject) != null) { return false; }
+            const written: TypeRef = this.written_bound_subject(&bounds[bi], subst);
+            const step: i32 = this.step_depth(asking, written, depth);
+            if (this.unmet_written_trait(&bounds[bi], subst, step, &unmet_subject) != null) { return false; }
         }
         if (subst == null || subst.replacements.length() == 0) { return true; }
         for (mut bi: i64 = 0; bi < bounds.length(); bi++) {
@@ -1103,9 +1118,24 @@ type struct TraitChecker {
             // target alone - is decided by the copy that binds it.
             const concrete: TypeRef = this.lookup_subst_for_param(bound.subject_param(), subst);
             if (!concrete.is_valid()) { continue; }
-            if (this.unmet_parameter_trait(bound, concrete, subst, depth) != null) { return false; }
+            if (this.unmet_parameter_trait(bound, concrete, subst, this.step_depth(asking, concrete, depth)) != null) {
+                return false;
+            }
         }
         return true;
+    }
+
+    /// The depth a question about `subject`, asked by `asking`'s
+    /// implementation at `depth`, is answered at: `depth` when `subject` is
+    /// the smaller type, else one more.  A chain of smaller questions ends
+    /// on its own, since a type has finitely many terms; only the others can
+    /// make a cycle, and they are what the budget counts.
+    step_depth(&this, asking: TypeRef, subject: TypeRef, depth: i32) -> i32 {
+        if (asking.is_valid() && subject.is_valid()
+                && this.arena.term_size(subject) < this.arena.term_size(asking)) {
+            return depth;
+        }
+        return depth + 1;
     }
 
     /// Whether every bound `func_decl` writes on an associated type of its

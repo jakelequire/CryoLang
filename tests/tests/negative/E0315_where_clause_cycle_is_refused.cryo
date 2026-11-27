@@ -1,0 +1,61 @@
+// E0315: an implementation whose where-clause asks, through any chain of
+// implementations, the question it is answering - about the same type, a
+// type of the same size, or an ever larger one - never holds: the chain is
+// cut, and the value is refused as not implementing the trait, rather than
+// the check running without end.  A chain of strictly smaller questions is
+// answered however long it is (tests/lang/trait_bound_deep_chain.cryo).
+![config(testing)]
+![config(negative, E0315)]
+namespace CryoTests::Negative::WhereClauseCycle;
+
+type trait Spin {
+    spin(&this) -> i32;
+}
+
+// Each type's implementation asks about a larger one.
+type struct Grow<T> {
+    value: T;
+}
+
+implement<T> trait Spin for struct Grow<T> where Grow<Grow<T>>: Spin {
+    spin(&this) -> i32 { return 1; }
+}
+
+// The question comes back after a smaller one: `Ring<i32>` asks `i32`,
+// whose implementation asks `Ring<i32>` again.
+type struct Ring<T> {
+    value: T;
+}
+
+implement<T> trait Spin for struct Ring<T> where T: Spin {
+    spin(&this) -> i32 { return 2; }
+}
+
+implement trait Spin for i32 where Ring<i32>: Spin {
+    spin(&this) -> i32 { return 3; }
+}
+
+// Two types of the same size ask each other.
+type struct Swap<A, B> {
+    a: A;
+    b: B;
+}
+
+implement<A, B> trait Spin for struct Swap<A, B> where Swap<B, A>: Spin {
+    spin(&this) -> i32 { return 4; }
+}
+
+function need(value: virtual &Spin) -> i32 {
+    return value.spin();
+}
+
+function main() -> int {
+    const grow: Grow<u8> = Grow::<u8> { value: 1 };
+    const ring: Ring<i32> = Ring::<i32> { value: 1 };
+    const swap: Swap<i64, u8> = Swap::<i64, u8> { a: 1, b: 2 };
+    const total: i32 = need(&grow) + need(&ring) + need(&swap);
+    //~^ ERROR[E0315] `CryoTests::Negative::WhereClauseCycle::Grow<u8>` does not implement `CryoTests::Negative::WhereClauseCycle::Spin`, so `&CryoTests::Negative::WhereClauseCycle::Grow<u8>` cannot become `virtual &CryoTests::Negative::WhereClauseCycle::Spin`
+    //~^^ ERROR[E0315] `CryoTests::Negative::WhereClauseCycle::Ring<i32>` does not implement `CryoTests::Negative::WhereClauseCycle::Spin`, so `&CryoTests::Negative::WhereClauseCycle::Ring<i32>` cannot become `virtual &CryoTests::Negative::WhereClauseCycle::Spin`
+    //~^^^ ERROR[E0315] `CryoTests::Negative::WhereClauseCycle::Swap<i64, u8>` does not implement `CryoTests::Negative::WhereClauseCycle::Spin`, so `&CryoTests::Negative::WhereClauseCycle::Swap<i64, u8>` cannot become `virtual &CryoTests::Negative::WhereClauseCycle::Spin`
+    return total as int;
+}
