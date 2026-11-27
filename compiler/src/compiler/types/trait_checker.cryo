@@ -47,6 +47,12 @@ import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::resolver::{ ResolutionContext, TypeResolver };
 
+/// How many steps a trait-bound question may take to a type no smaller than
+/// the one that asked it before it is refused as a cycle
+/// (`TraitChecker::type_implements_trait`).  Steps to a smaller type - a
+/// pointee, an element, a part - are free, so the budget bounds only a chain
+/// that repeats a question or grows its type.
+const BOUND_STEP_BUDGET: i32 = 16;
 
 /// Read-only trait-satisfaction query engine. See file header.
 type struct TraitChecker {
@@ -93,7 +99,7 @@ type struct TraitChecker {
     /// The trait-impl registry is keyed by that identity too, so one name
     /// asks both questions.
     type_implements_trait(&this, ty: TypeRef, trait_name: DefId, depth: i32) -> boolean {
-        if (depth >= 16) {
+        if (depth >= BOUND_STEP_BUDGET) {
             // Budget spent on a cyclic or ever-growing impl/where-clause
             // chain. Return false (unchanged) so an unsatisfiable bound never
             // accidentally enables body specialization - but surface a clean
@@ -108,7 +114,8 @@ type struct TraitChecker {
             const tn: string = this.intern_table.shown(this.arena.defs.path_of(trait_name));
             this.diagnostics.emit(Diagnostic::error(
                 ErrorCode::E0900_INTERNAL_COMPILER_ERROR,
-                fmt::format("trait-bound resolution exceeded the recursion limit (16 steps to a type no smaller than the one before) while checking `%s`; the impl or where-clause chain may be cyclic", tn)));
+                fmt::format("trait-bound resolution exceeded the recursion limit (%d steps to a type no smaller than the one before) while checking `%s`; the impl or where-clause chain may be cyclic",
+                    BOUND_STEP_BUDGET, tn)));
             return false;
         }
 
@@ -397,7 +404,7 @@ type struct TraitChecker {
     /// `implementation_at`, sharing the recursion budget of the bound check
     /// that asks it.
     implementation_at_depth(&this, trait_def: DefId, args: &[TypeRef], value: TypeRef, depth: i32) -> DeclarationNode* {
-        if (this.generic_registry == null || depth >= 16) { return null; }
+        if (this.generic_registry == null || depth >= BOUND_STEP_BUDGET) { return null; }
         const heads: [DeclarationNode*] = this.generic_registry.heads_for(trait_def, value, this.intern_table);
         for (mut i: i64 = 0; i < heads.length(); i++) {
             const block: mut ImplBlock* = DeclarationNode::impl_of(heads[i]);

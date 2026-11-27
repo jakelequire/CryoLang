@@ -649,6 +649,39 @@ language's features; each is a branch of its own after the merge.
   opcodes, HTTP/2's frame types) carries its own `op_from_u8`.  The
   conversion answers `Option` (or `TryFrom`) for a value no variant holds.
 
+## Text and values: decided for after v1.0
+
+Jake decided each of these during the standard library's v1 freeze: a v1.0
+form, and the designed path after v1.0.  The first two v1.0 forms are the
+language as it is; the last two are still to be built before v1.0.
+
+- **Mixed text `==`.**  For v1.0, `==` takes one type on both sides, so
+  `view == Str::new("abc")` and `owned.as_str() == view` are written out.
+  After v1.0: default type parameters in the language, then `Eq<Rhs =
+  This>`, so `==` finds its implementation by the pair of operand types the
+  way text `+` already does (`implement Add<Str, String> for Str`), with the
+  text pairs written as implementations and no conversion of an operand.
+- **Methods on a bare string literal.**  For v1.0 a literal's methods are
+  reached through `Str::new("a,b").contains(",")` or a typed binding.  After
+  v1.0, as part of option C: a literal whose type nothing declares is a
+  `Str`, so `"a,b".contains(",")` finds `Str`'s methods with no change to
+  member lookup.
+- **Two values together.**  `Pair` is the one convention for a two-value
+  result, moved into `core` so `core`'s own results can name it; the tuple
+  results (`overflowing_*`, `u64::parse_radix_prefix`, `Futures::join` and
+  `try_join`, `UdpSocket.receive_from`) become `Pair`.  After
+  v1.0: tuples gain `Eq`, `Clone`, `Debug` and `Display` structurally, as
+  they have `Copy`, `Send` and `Sync`, and a method call on a tuple.
+- **A loop over a collection.**  `for (x in xs)` over an array consumes it,
+  through a language item rather than a method found by its spelling, and a
+  loop borrows by `xs.iterate_references()`.  Today the loop calls a method
+  spelled `iter` on any type that is not an iterator (`Array`, `Slice`, the
+  hash and B-tree maps and sets), which copies `Copy` elements.  Still open
+  before it is built: the trait's name and receiver, what a loop over a
+  `&Slice<T>` does (an implementation for `&Slice<T>` cannot be written),
+  and whether a loop over a map or set consumes it too.  After v1.0: an iterator that
+  yields `&T`, so a borrowing loop binds a reference instead of a pointer.
+
 ## Retire `string`'s text methods
 
 Decided: a literal's text methods are `Str`'s.  `string`'s own methods
@@ -967,7 +1000,7 @@ it names, built or not.
 | 23 | `Str` stays a `Copy` read-only view value; `as_bytes()` returns `&Slice<u8>`. |
 | 24 | `Scope::spawn` accepts borrowing closures, under a rule tied to the scope. |
 | 25 | HTTPS connects by trying every resolved address in turn, IPv4 first. |
-| 26 | `SocketAddr::parse` accepts `a.b.c.d:port` and `[v6]:port`, beside `parse_v4`. |
+| 26 | `SocketAddress::parse` accepts `a.b.c.d:port` and `[v6]:port`, and is the one parser: `parse_v4` is deleted. |
 | 27 | An opaque `implement Trait` value is `Copy` only when the return type says `+ Copy`; the concrete type's `Copy` does not show through. |
 | 28 | Any trait method, not only a default, may return `implement Trait`, and an implementation may write its own body with its own concrete type, as a hidden associated type per implementation.  Such a method is not callable through `virtual &Trait`, and the refusal says so. |
 | 29 | One trait over every iterator yielding `T*`, implemented once for every such iterator, carries `copied` and `cloned`. |

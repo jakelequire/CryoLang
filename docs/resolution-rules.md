@@ -167,6 +167,17 @@ yet is recorded with the change that builds it, not here.
      method was refused as a missing method.  A `T*` for `T` is not
      covered by this ruling.  (Jake, the v1 freeze)
 
+732. **The freeze's smaller calls stand as built.**  A scoped thread's
+     panic that a `join` collected belongs to the caller of `join`; the
+     scope re-panics only for one no `join` took.  `SocketAddress::parse`
+     is the one socket-address parser.  A string pattern matches any
+     subject type a string converts to and that has `Eq`.  Buffered
+     readers and writers borrow their source; locks do not poison; HMAC is
+     the two concrete types `HmacSha256` and `HmacSha1`; `step_by` below 1
+     panics; the local UTC offset is a whole minute, UTC where the system
+     cannot place the instant.  The trait-bound budget is a named
+     constant.  (Jake, the v1 freeze)
+
 ### 2026-11-26
 
 725. **`Str`'s text methods take their text by value.**  `contains`,
@@ -192,8 +203,8 @@ yet is recorded with the change that builds it, not here.
      and `sys`.  A standard-library enum may gain variants (`Option`,
      `Result`, `Ordering` and `Bound` excepted), so a `match` over one
      keeps a `_` arm.  `printf`, `eprintf` and `format` stay public as
-     the legacy text path.  (Jake, the v1 freeze; the four fixed enums
-     are provisional)
+     the legacy text path.  (Jake, the v1 freeze, the four fixed enums
+     included)
 
 724. **The HTTP/2 and WebSocket wire records are internal.**  HTTP/2's
      decoded `Frame`, the `Settings` record a connection folds and the
