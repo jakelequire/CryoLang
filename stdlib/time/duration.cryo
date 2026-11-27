@@ -264,17 +264,6 @@ public type struct Duration with [Eq, Ord, Debug] {
         };
     }
 
-    /// `this * factor`. Panics when the seconds overflow `u64`;
-    /// `checked_multiply` answers `None` instead.
-    public scale(&this, factor: u64) -> Duration {
-        match (this.checked_multiply(factor)) {
-            Option::Some(product) => { return product; }
-            Option::None => {
-                panic("Duration::scale: overflows the seconds", intrinsics::location());
-            }
-        }
-    }
-
     /// `this * factor`, or `None` when the seconds would overflow `u64`.
     public checked_multiply(&this, factor: u64) -> Option<Duration> {
         // The nanoseconds stay below 1e9, so their product with any `u64`
@@ -292,25 +281,17 @@ public type struct Duration with [Eq, Ord, Debug] {
     /// `this / divisor`, or `None` when `divisor` is zero.
     public checked_divide(&this, divisor: u64) -> Option<Duration> {
         if (divisor == 0) { return Option::None; }
-        return Option::Some(this.divide(divisor));
-    }
-
-    /// `this * factor` for a floating-point factor.
-    public multiply_f64(&this, factor: f64) -> Duration {
-        return Duration::from_seconds_f64(this.as_seconds_f64() * factor);
-    }
-
-    /// `this / divisor`. Panics on division by zero.
-    public divide(&this, divisor: u64) -> Duration {
-        if (divisor == 0) {
-            panic("Duration::divide: division by zero", intrinsics::location());
-        }
         const secs:        u64 = this.secs / divisor;
         const rem_secs:    u64 = this.secs % divisor;
         // `rem_secs` is below `divisor`, so in `u64` its nanoseconds wrap
         // for a divisor past about 1.8e10; in `u128` they cannot.
         const total_nanos: u128 = (rem_secs as u128) * (Duration::NANOSECONDS_PER_SECOND as u128) + (this.nanos as u128);
-        return Duration { secs: secs, nanos: (total_nanos / (divisor as u128)) as u32 };
+        return Option::Some(Duration { secs: secs, nanos: (total_nanos / (divisor as u128)) as u32 });
+    }
+
+    /// `this * factor` for a floating-point factor.
+    public multiply_f64(&this, factor: f64) -> Duration {
+        return Duration::from_seconds_f64(this.as_seconds_f64() * factor);
     }
 
 
@@ -351,17 +332,27 @@ implement trait Sub<Duration, Duration> for struct Duration {
     }
 }
 
-/// `d * n`, as `scale`. Panics when the product overflows the seconds.
+/// `d * n`. Panics when the product overflows the seconds.
 implement trait Mul<u64, Duration> for struct Duration {
     mul(&this, rhs: &u64) -> Duration {
-        return this.scale(*rhs);
+        match (this.checked_multiply(*rhs)) {
+            Option::Some(product) => { return product; }
+            Option::None => {
+                panic("Duration * u64: overflows the seconds", intrinsics::location());
+            }
+        }
     }
 }
 
-/// `d / n`, as `divide`. Panics on division by zero.
+/// `d / n`. Panics on division by zero.
 implement trait Div<u64, Duration> for struct Duration {
     div(&this, rhs: &u64) -> Duration {
-        return this.divide(*rhs);
+        match (this.checked_divide(*rhs)) {
+            Option::Some(quotient) => { return quotient; }
+            Option::None => {
+                panic("Duration / u64: division by zero", intrinsics::location());
+            }
+        }
     }
 }
 
