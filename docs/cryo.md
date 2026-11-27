@@ -365,7 +365,7 @@ In performance-sensitive or cross-platform code, prefer the explicit-width forms
 
 `char` and `u8` classify ASCII with methods of the same names and meaning: `is_digit`, `is_alpha`, `is_hex_digit`, `is_whitespace`, `is_uppercase` (`A`-`Z`), `is_lowercase` (`a`-`z`), and the case folds `to_ascii_lowercase` and `to_ascii_uppercase`. A `char` outside ASCII, a non-ASCII letter among them, answers false to each test and folds to itself; so does a `u8` of 0x80 or above.
 
-`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). At the FFI boundary, `Str::new` reads a `string` from C, and `String::with_null` makes a NUL-terminated copy whose `as_c_string` hands it to C. A program asks its questions of a `string`'s text through `Str`: `Str::new(text).contains("::")`. `Str`'s text methods (`contains`, `starts_with`, `ends_with`, `find`, `find_last`, `split`, `split_nonempty`, `split_once`, `split_once_from_end`, `strip_prefix`, `strip_suffix`, `replace`, `equals_case_insensitive`, `common_prefix_length`) take the text they search for as a `Str` by value, so a literal argument is converted where it is passed (section 16.1.1) and a `String` is passed as its view, `name.as_str()`. A `string` has no searches or slicing of its own - `text.contains("b")`, `text.find("b")` or `text.substring(1, 2)` is refused (E0358) - and `Str`'s `find`, `find_last`, `find_byte` and `find_last_byte` answer an `Option`. The text methods a `string` keeps are `length` and `eq`, the door for a NUL-terminated string from C, which may be removed after 1.0 (a number is read with `Str.parse::<T>()`, a path taken apart with `Path`); `a + b` on two `string`s is a fresh concatenation, through the standard library's internal `append`.
+`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). At the FFI boundary, `Str::new` reads a `string` from C, and `String::with_null` makes a NUL-terminated copy whose `as_c_string` hands it to C. A program asks its questions of a `string`'s text through `Str`: `Str::new(text).contains("::")`. `Str`'s text methods (`contains`, `starts_with`, `ends_with`, `find`, `find_last`, `split`, `split_nonempty`, `split_once`, `split_once_from_end`, `strip_prefix`, `strip_suffix`, `replace`, `equals_case_insensitive`, `common_prefix_length`) take the text they search for as a `Str` by value, so a literal argument is converted where it is passed and a `String` is read as its view (section 16.1.1). A `string` has no searches or slicing of its own - `text.contains("b")`, `text.find("b")` or `text.substring(1, 2)` is refused (E0358) - and `Str`'s `find`, `find_last`, `find_byte` and `find_last_byte` answer an `Option`. The text methods a `string` keeps are `length` and `eq`, the door for a NUL-terminated string from C, which may be removed after 1.0 (a number is read with `Str.parse::<T>()`, a path taken apart with `Path`); `a + b` on two `string`s is a fresh concatenation, through the standard library's internal `append`.
 
 ### 2.2 Pointer Types
 
@@ -4466,7 +4466,19 @@ function print_view(text: Str) -> void { fmt::println(f"{text}"); }
 - a struct literal's field value, and a field's declared default, against the field's type (`Holder { text: "text" }`, `label: Str = "text";`);
 - an array literal's element, against the element type the literal is declared to have (`const names: [Str] = ["a", "b"];`, `[Str; 2]`, or a `[Str]` parameter). A literal with no declared type takes its first element's type, which is no declaration: a later element is converted to it only by a trait.
 
-Each of these sites asks the same two questions in the same order: whether a trait makes the value's type into the declared one (a trait object, a slice reference), and if not, whether a converter is registered for the pair.
+Each of these sites asks the same two questions in the same order: whether a trait makes the value's type into the declared one (a trait object, a slice reference, or a `Deref` target, below), and if not, whether a converter is registered for the pair.
+
+**An owner read as its view.** A value whose type implements `Deref` with a `Target` that is the declared type, where that target is `Copy`, is read as its target at each of these sites: `*value.deref()`, copied out of storage the value owns. So a `String` is passed, bound, returned, assigned or stored where a `Str` is declared, and a `PathBuf` where a `Path` is:
+
+```cryo
+function length_of(text: Str) -> i64 { return text.length() as i64; }
+
+const name: String = String::from("ada");
+length_of(name);                              // length_of(*name.deref())
+const view: Str = name;                       // name is read, not moved
+```
+
+The owner is borrowed for the read and stays whole; the view is valid while the owner is, and an owner that is a temporary lives to the end of its statement. The read is one step: a `Box<String>` is not read as a `Str`, and a target that is not `Copy` is not copied out (a `Box<String>` where a `String` is declared is refused, `E0214`). A reference to an owner is not an owner: `&String` where a `Str` is declared is a mismatch. The read and a converter are not chained either: a `String` where a converter's parameter type, not its result, is the `Deref` target (`fmt::println(name)`, whose parameter is `Arguments`, converted from a `Str`) is refused; write `name.as_str()` or an f-string.
 
 **Where it does not.** Nothing else converts, and the value must already have the declared type (`E0200`, or `E0214` for an operator's operand):
 

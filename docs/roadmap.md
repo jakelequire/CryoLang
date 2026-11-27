@@ -1052,11 +1052,15 @@ Jake's answers to the test-infrastructure plan.
   where it stands - an argument, a typed binding's initializer, a returned
   or assigned value, a struct field - by value; `AsSlice` gives a
   container's reference as a slice reference; and a fixed array answers a
-  trait's methods through its slice.  A by-value view of a receiver (a
-  `string` read as a `Str` for a method call) would be a fifth.  Whether
-  one rule should cover all of them - which places it applies at, whether
-  a receiver is one, and which mechanism wins where two could - is open,
-  and none is added until it is answered.
+  trait's methods through its slice.  One case is settled: where a type
+  is declared, an owner whose `Deref` target is that type and is `Copy`
+  is read as it (a `String` where a `Str` is declared), asked at the same
+  step as the other traits, before converters, and never chained with a
+  converter.  A by-value view of a receiver (a `string` read as a `Str`
+  for a method call) would be a fifth mechanism.  Whether one rule should
+  cover all of them - which places it applies at, whether a receiver is
+  one, and which mechanism wins where two could - is open, and none is
+  added until it is answered.
 - **How wide a `char` is**, and so what a character literal holds above
   255 (`'\u{e9}'` fits either way; `'\u{1F600}'` does not fit a byte).
   Undecided.

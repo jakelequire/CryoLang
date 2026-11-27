@@ -133,6 +133,17 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-27
+
+728. **An owner is read as its view where the view is declared.**  At
+     every site that declares a type (an argument, a typed binding, a
+     returned or assigned value, a struct field, an array element), a
+     value whose `Deref` target is the declared type, where that target is
+     `Copy`, is read as `*value.deref()`.  It is the first question those
+     sites already share, answered by the `Deref` language item and the
+     value's implementation by identity: no new door, and no type named.
+     One step only, never chained with a converter.  (Jake, the v1 freeze)
+
 ### 2026-11-26
 
 725. **`Str`'s text methods take their text by value.**  `contains`,

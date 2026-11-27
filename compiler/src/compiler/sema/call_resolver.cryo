@@ -3293,6 +3293,8 @@ type struct CallResolver {
     /// callee would read a garbage length.  This pass closes that gap; it is a
     /// no-op for arguments that already match or only need a builtin coercion, so
     /// callers may invoke it unconditionally after choosing the overload.
+    /// An argument that bound by being read through `Deref` is read so here
+    /// too (`SemaVisitor::convert_through_deref`).
     apply_overload_converter_args(mut &this, visitor: mut SemaVisitor*, call: mut CallExpr*,
                                   param_types: &Slice<TypeRef>) -> void {
         const n: i64 = param_types.length() as i64;
@@ -3306,6 +3308,14 @@ type struct CallResolver {
             if (arg_ty.equals(param_ty)) { continue; }
             if (this.checker.can_implicit_convert(arg_ty, param_ty)) { continue; }
             if (this.literals.int_literal_fits_target(arg, param_ty)) { continue; }
+            if (this.binding.reads_through_deref(param_ty, arg_ty)) {
+                match (visitor.convert_through_deref(arg, arg_ty, param_ty)) {
+                    TraitConversionOutcome::Converted(c) => { call.arguments[i] = c; }
+                    TraitConversionOutcome::Refused      => { }
+                    TraitConversionOutcome::Mismatch     => { }
+                }
+                continue;
+            }
             if (!this.has_implicit_converter(arg_ty, param_ty)) { continue; }
             this.try_apply_implicit_conversion(visitor, &call.arguments, i, arg, arg_ty, param_ty);
         }
@@ -5892,6 +5902,7 @@ type struct CallResolver {
             }
         }
         if (tier >= 3 && this.has_implicit_converter(arg, param)) { return true; }
+        if (tier >= 3 && this.binding.reads_through_deref(param, arg)) { return true; }
         return false;
     }
 

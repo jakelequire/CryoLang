@@ -4586,13 +4586,37 @@ type struct SemaVisitor {
 
     /// Convert `expr`, of type `from`, where `to` is wanted and a trait
     /// makes the one into the other: to a trait object through the trait the
-    /// object names, to a slice reference through the slice traits.
+    /// object names, to a slice reference through the slice traits, and to
+    /// any other type through `Deref` when `to` is the value's `Copy`
+    /// target.
     convert_through_trait(mut &this, expr: mut ExpressionNode*, from: TypeRef, to: TypeRef) -> TraitConversionOutcome {
         const target: Type* = this.arena.lookup(to);
         if (target != null && target.is_wide_reference()) {
             return this.convert_to_slice_reference(expr, from, to);
         }
-        return this.convert_to_object(expr, from, to);
+        if (target != null && target.kind == TypeKind::Object) {
+            return this.convert_to_object(expr, from, to);
+        }
+        return this.convert_through_deref(expr, from, to);
+    }
+
+    /// Convert `expr`, a value of type `from`, to its `Deref` target `to`:
+    /// `*expr.deref()`, the target copied out of storage the value owns
+    /// (`MethodBinding::reads_through_deref` says when).  The value is
+    /// borrowed for the read and not moved.  Anything else is a mismatch
+    /// for the site to report.
+    convert_through_deref(mut &this, expr: mut ExpressionNode*, from: TypeRef, to: TypeRef) -> TraitConversionOutcome {
+        if (expr == null || !this.binding.reads_through_deref(to, from)) { return TraitConversionOutcome::Mismatch; }
+        const at: SourceSpan = expr.span;
+        const callee: mut ExpressionNode* = this.member.lang_method_callee(expr, LangItem::DerefDeref, at);
+        if (callee == null) { return TraitConversionOutcome::Mismatch; }
+        mut call: mut ExpressionNode* = ExpressionNode::call_expr(callee, at);
+        call.generated = true;
+        const star: Token = Token::new(TokenType::Star, "*", at.start_line as int, at.start_col as int);
+        const read: mut ExpressionNode* = ExpressionNode::synthetic_unary(star, call, at);
+        const made: TypeRef = this.resolve_expr(read);
+        if (!made.is_valid() || !this.checker.can_assign(made, to)) { return TraitConversionOutcome::Mismatch; }
+        return TraitConversionOutcome::Converted(read);
     }
 
     /// Convert `expr`, a reference to a container, to the slice reference

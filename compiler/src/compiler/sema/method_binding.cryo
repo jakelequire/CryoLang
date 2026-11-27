@@ -69,6 +69,7 @@ import compiler::types::inference::{ InferCtx };
 import compiler::types::resolver::{ ResolutionContext };
 import compiler::types::substitution::{ TypeSubstitution };
 import compiler::types::trait_checker::{ TraitChecker };
+import compiler::types::ownership::{ OwnershipQuery };
 import compiler::types::type_base::{ Type };
 import compiler::types::type_ref::{ TypeRef };
 import compiler::types::user_defined::{ MethodInfo, TraitType };
@@ -2376,6 +2377,35 @@ type struct MethodBinding {
         const converted: TypeRef = this.resolve_trait_impl_method_return(container, this.ctx.defs.leaf_of(method).spelling());
         if (!converted.is_valid()) { return actual; }
         return converted;
+    }
+
+    /// Whether a value of type `actual` is read as `declared`, the type a
+    /// site declares for it: `actual` implements `Deref` with `Target`
+    /// equal to `declared`, and `declared` is `Copy`.  The read copies the
+    /// target out of storage the value owns, so the owner stays where it
+    /// is, and only a `Copy` target can be copied out.  One step: a target
+    /// that derefs again is not followed, and a reference or pointer to an
+    /// owner is not an owner.
+    reads_through_deref(mut &this, declared: TypeRef, actual: TypeRef) -> boolean {
+        const actual_t: Type* = this.arena.lookup(actual);
+        if (actual_t == null) { return false; }
+        if (actual_t.kind != TypeKind::Struct && actual_t.kind != TypeKind::Enum
+                && actual_t.kind != TypeKind::InstantiatedType) {
+            return false;
+        }
+        const trait_id: DefId = this.ctx.generic_registry.wellknown(LangItem::Deref);
+        if (!trait_id.is_valid() || this.trait_checker().select_impl(trait_id, actual, 0) == null) {
+            return false;
+        }
+        const method: DefId = this.ctx.generic_registry.wellknown(LangItem::DerefDeref);
+        if (!method.is_valid()) { return false; }
+        const returned: Type* = this.arena.lookup(
+            this.resolve_trait_impl_method_return(actual, this.ctx.defs.leaf_of(method).spelling()));
+        if (returned == null || returned.kind != TypeKind::Pointer
+                || !returned.as_pointer().pointee.equals(declared)) {
+            return false;
+        }
+        return OwnershipQuery::is_copy(this.arena, this.ctx.generic_registry, this.intern, declared);
     }
 
     /// Mono-after-sema: resolve a trait-impl method's return for a CONCRETE
