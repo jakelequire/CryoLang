@@ -365,7 +365,7 @@ In performance-sensitive or cross-platform code, prefer the explicit-width forms
 
 `char` and `u8` classify ASCII with methods of the same names and meaning: `is_digit`, `is_alpha`, `is_hex_digit`, `is_whitespace`, `is_uppercase` (`A`-`Z`), `is_lowercase` (`a`-`z`), and the case folds `to_ascii_lowercase` and `to_ascii_uppercase`. A `char` outside ASCII, a non-ASCII letter among them, answers false to each test and folds to itself; so does a `u8` of 0x80 or above.
 
-`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). At the FFI boundary, `Str::new` reads a `string` from C, and `String::with_null` makes a NUL-terminated copy whose `as_c_string` hands it to C. A program asks its questions of a `string`'s text through `Str`: `Str::new(text).contains("::")`. `Str`'s text methods (`contains`, `starts_with`, `ends_with`, `find`, `find_last`, `split`, `split_nonempty`, `split_once`, `split_once_from_end`, `strip_prefix`, `strip_suffix`, `replace`, `equals_case_insensitive`, `common_prefix_length`) take the text they search for as a `Str` by value, so a literal argument is converted where it is passed (section 16.1.1) and a `String` is passed as its view, `name.as_str()`. A `string` has no searches or slicing of its own - `text.contains("b")`, `text.find("b")` or `text.substring(1, 2)` is refused (E0358) - and `Str`'s `find`, `find_last`, `find_byte` and `find_last_byte` answer an `Option`. The text methods a `string` keeps are `length`, `eq`, `parse_int`, `split_char`, `to_ascii_upper`, `common_prefix_length`, `extension` and `join`; `a + b` on two `string`s is a fresh concatenation, through the standard library's internal `append`.
+`string` is a NUL-terminated raw byte pointer matching the C ABI. Inside the standard library, length-typed UTF-8 is modelled by [`Str`](#19-the-standard-library) (borrowed) and [`String`](#19-the-standard-library) (owned). At the FFI boundary, `Str::new` reads a `string` from C, and `String::with_null` makes a NUL-terminated copy whose `as_c_string` hands it to C. A program asks its questions of a `string`'s text through `Str`: `Str::new(text).contains("::")`. `Str`'s text methods (`contains`, `starts_with`, `ends_with`, `find`, `find_last`, `split`, `split_nonempty`, `split_once`, `split_once_from_end`, `strip_prefix`, `strip_suffix`, `replace`, `equals_case_insensitive`, `common_prefix_length`) take the text they search for as a `Str` by value, so a literal argument is converted where it is passed (section 16.1.1) and a `String` is passed as its view, `name.as_str()`. A `string` has no searches or slicing of its own - `text.contains("b")`, `text.find("b")` or `text.substring(1, 2)` is refused (E0358) - and `Str`'s `find`, `find_last`, `find_byte` and `find_last_byte` answer an `Option`. The text methods a `string` keeps are `length` and `eq`, the door for a NUL-terminated string from C, which may be removed after 1.0 (a number is read with `Str.parse::<T>()`, a path taken apart with `Path`); `a + b` on two `string`s is a fresh concatenation, through the standard library's internal `append`.
 
 ### 2.2 Pointer Types
 
@@ -5229,6 +5229,19 @@ generator.shuffle(&cards);
 ```
 
 `Rng::for_current_thread()` is the thread's generator the free functions use, for code written against `R: RandomSource`, such as a `distribution` sampler. `Rng` is xoshiro256**: fast and statistically strong, but its output can be predicted from what it has produced, so it is **not for cryptography**. Keys, tokens and nonces come from `secure::SecureRng`, which reads the operating system's cryptographic generator (`getrandom` on Linux, `RtlGenRandom` on Windows) and has the same methods.
+
+### 19.5 Stability
+
+What 1.0 promises about the standard library, by tier:
+
+- **Stable**: every module not named below. A stable declaration keeps its name, its signature and its behaviour through every 1.x release; additions are made beside it. Networking's foundations are stable: the address types (`net::address`: IP and socket addresses, `Url`), DNS resolution and the TCP and UDP sockets.
+- **Preview**: `net::http`, `net::http2`, `net::ws` and `net::tls`. They work and are tested, and they may change shape in a 1.x release: a handler is a plain function, a body is read and written whole, and every failure is an `IoError`, each of which is expected to change.
+- **Unstable**: `ffi` (the libc and OpenSSL bindings) and `sys` (raw system calls). They bind the platform's own interface as it is and follow it; their signatures may change in any release.
+
+Two rules hold across every tier:
+
+- **A standard-library enum may gain variants**, except `Option`, `Result`, `Ordering` and `Bound`, whose variants are fixed. Matching is exhaustive, so a `match` over any other standard-library enum (`IoErrorKind`, `FileType`, `LogLevel`, ...) should keep a `_` arm; a 1.x release that adds a variant does not count as a change to the enum's shape.
+- **`printf`, `eprintf` and `format` are the legacy text path.** They read a C format string: when it is a literal, the compiler compares each directive's category with its argument and warns on a mismatch (W0013), and a format made at run time is not checked at all. They stay public and supported; new code writes an f-string, `println(f"{name} is {age}")`, whose every value is formatted through `Display` or `Debug`.
 
 ---
 

@@ -135,6 +135,32 @@ yet is recorded with the change that builds it, not here.
 
 ### 2026-11-26
 
+725. **`Str`'s text methods take their text by value.**  `contains`,
+     `starts_with`, `ends_with`, `find`, `find_last`, `split`,
+     `split_nonempty`, `split_once`, `split_once_from_end`, `strip_prefix`,
+     `strip_suffix`, `replace`, `equals_case_insensitive` and
+     `common_prefix_length` take a `Str`, not a `&Str`, so a literal
+     argument is converted where it is passed and a `String` is passed as
+     its view.  `Eq`, `Ord` and `Add` keep their trait shapes.  (Jake, the
+     v1 freeze)
+
+726. **A `string` keeps `length` and `eq` and nothing else.**  They are
+     the door for a NUL-terminated string from C, and may be removed after
+     1.0.  `parse_int`, `join`, `split_char`, `to_ascii_upper`,
+     `extension` and `common_prefix_length` are deleted; a number is read
+     by `Str.parse::<T>()`, which is `T::try_from(Str)`, so 718's one
+     reader stands without `string.parse_int`.  (Jake, the v1 freeze)
+
+727. **The standard library's stability tiers.**  Stable: every module
+     but those named here, networking's addresses, DNS and TCP and UDP
+     sockets included.  Preview, which may change shape in a 1.x:
+     `net::http`, `net::http2`, `net::ws`, `net::tls`.  Unstable: `ffi`
+     and `sys`.  A standard-library enum may gain variants (`Option`,
+     `Result`, `Ordering` and `Bound` excepted), so a `match` over one
+     keeps a `_` arm.  `printf`, `eprintf` and `format` stay public as
+     the legacy text path.  (Jake, the v1 freeze; the four fixed enums
+     are provisional)
+
 724. **The HTTP/2 and WebSocket wire records are internal.**  HTTP/2's
      decoded `Frame`, the `Settings` record a connection folds and the
      buffered stream's `read_http2_frame` are internal to the standard

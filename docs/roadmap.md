@@ -690,8 +690,11 @@ methods only at a root (the parent of `/x` is `/`, not `.`).
 
 That is where this item ends: every `string` method that copies text is
 internal, and the internal ones nothing calls are deleted - all but
-`append`, which `a + b` on two `string`s calls.  The public `join`,
-`extension` and `split_char` read through `Str` and copy into a `String`.
+`append`, which `a + b` on two `string`s calls.  The six public ones the
+compiler never called - `parse_int`, `join`, `split_char`,
+`to_ascii_upper`, `extension` and `common_prefix_length` - are deleted
+too: a number is read by `Str.parse::<T>()`, a path taken apart by
+`Path`, and text folded or compared by `Str`'s own methods.
 `length` (301 compiler sites) and `eq` (139) are not retired by
 wrapping each receiver in `Str::new`, which a later change would rewrite
 again; they go with the next item, which changes what the compiler's text

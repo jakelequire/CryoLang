@@ -3243,12 +3243,10 @@ implement f64 {
     }
 }
 
-// Bridge methods on the raw `string` C-string view.
-//
-// New-stdlib code prefers `Str` and `String<A>` from `collections::str` /
-// `collections::string`.  The methods below exist to keep the legacy-shaped
-// self-hosted compiler building on the new stdlib without a parallel
-// rewrite of every `text.length()` / `text.substring(...)` call site.
+// The raw `string` C-string view keeps two text methods of its own, the
+// door for a NUL-terminated string from C: `length` and `eq`.  Every other
+// question of its text is asked through `Str::new(text)`.  These two may be
+// removed after 1.0, once the compiler's own text is `Str` and `String`.
 
 implement string {
     /// The number of bytes before the NUL terminator; 0 for a null
@@ -3276,25 +3274,6 @@ implement string {
         return buf;
     }
 
-    /// Length, in bytes, of the longest common leading prefix of `this` and
-    /// `other`. Useful for ranking candidates by shared-path overlap.
-    public common_prefix_length(&this, other: string) -> i64 {
-        if (this == null || other == null) { return 0; }
-        mut i: i64 = 0;
-        while (this[i] != 0 && other[i] != 0 && this[i] == other[i]) { i += 1; }
-        return i;
-    }
-
-    /// This text read as a decimal integer of type `T`, exactly as
-    /// `T::try_from(Str)` reads it (`Str.parse::<T>()` is the same read): an
-    /// optional `+` or `-` for a signed `T`, then decimal digits and nothing
-    /// else, refused when the text is empty, holds any other byte, or writes
-    /// a value `T` does not hold. `"42".parse_int::<u16>()` is `Ok(42)`;
-    /// `"4x2"`, `"300"` as a `u8`, and `"0x10"` are each an `Err`.
-    public parse_int<T>(&this) -> Result<T, ConversionError> where T: Integer + TryFrom<Str> {
-        return T::try_from(Str::new(this));
-    }
-
     /// Byte-wise content equality, taking `other` BY VALUE so it accepts
     /// string literals directly (`name.eq("void")`). This is the ergonomic
     /// replacement for the `strcmp(a, b) == 0` idiom; the `Eq` trait's
@@ -3306,71 +3285,5 @@ implement string {
         const la: u64 = libc::strlen(this);
         if (la != libc::strlen(other)) { return false; }
         return libc::strncmp(this, other, la) == 0;
-    }
-
-    /// Split on a single byte separator, returning each piece as a freshly
-    /// allocated string. Adjacent separators yield empty pieces; the result
-    /// always has (separator-count + 1) entries.
-    public split_char(&this, sep: i8) -> [string] {
-        mut parts: [string] = [];
-        if (this == null) { return parts; }
-        const text: Str = Str::new(this);
-        const len: i64 = text.length();
-        mut start: i64 = 0;
-        for (mut i: i64 = 0; i < len; i++) {
-            if (this[i] == sep) {
-                parts.push(String::from_str(text.byte_substring(start, i)).into_raw());
-                start = i + 1;
-            }
-        }
-        parts.push(String::from_str(text.byte_substring(start, len)).into_raw());
-        return parts;
-    }
-
-    /// ASCII-fold to uppercase, returning a freshly allocated string.
-    public to_ascii_upper(&this) -> string {
-        if (this == null) { return ""; }
-        const len: i64 = this.length() as i64;
-        mut buf: string = allocator::allocate((len + 1) as u64, 1) as string;
-        if ((buf as void*) == null) {
-            panic("string::to_ascii_upper: allocation failed", intrinsics::location());
-        }
-        for (mut i: i64 = 0; i < len; i++) {
-            const c: char = this[i];
-            buf[i] = c.to_ascii_uppercase();
-        }
-        buf[len] = '\0';
-        return buf;
-    }
-
-    /// The file extension without the dot, or "" when there is none. A
-    /// leading-dot name (e.g. `.gitignore`) has no extension.
-    public extension(&this) -> string {
-        const text: Str = Str::new(this);
-        const len: i64 = text.length();
-        mut base_start: i64 = 0;
-        for (mut i: i64 = 0; i < len; i++) {
-            if (this[i] == 47 || this[i] == 92) { base_start = i + 1; }     // '/' or '\'
-        }
-        mut dot: i64 = -1;
-        for (mut i: i64 = base_start; i < len; i++) {
-            if (this[i] == 46) { dot = i; }     // '.'
-        }
-        if (dot <= base_start) { return ""; }
-        return String::from_str(text.byte_substring(dot + 1, len)).into_raw();
-    }
-
-    /// Join `seg` onto `this` with a single `/` separator. An empty `this`
-    /// returns `seg`; an empty `seg` returns `this`; an absolute `seg`
-    /// (leading separator) replaces `this` entirely.
-    public join(&this, seg: string) -> string {
-        if (this.length() == 0) { return seg; }
-        if (seg.length() == 0) { return this; }
-        if (seg[0] == 47 || seg[0] == 92) { return seg; }       // absolute
-        mut joined: String = String::from_str(Str::new(this));
-        const last: char = this[this.length() - 1];
-        if (last != 47 && last != 92) { joined.push_byte(47); }
-        joined.append(Str::new(seg));
-        return joined.into_raw();
     }
 }
