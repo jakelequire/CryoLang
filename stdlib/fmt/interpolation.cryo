@@ -31,6 +31,7 @@
 
 namespace std::fmt::interpolation;
 
+import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
@@ -136,17 +137,52 @@ where T: Display {
 /// way a reference argument is borrowed, and are read when the arguments
 /// are written; an `Arguments` kept past that call names values that may
 /// be gone.
+///
+/// Plain text is an `Arguments` too: a literal or a `Str` written where an
+/// `Arguments` is declared is converted (`fmt::println("done")`,
+/// `fmt::println(name.as_str())`), and writes as itself.
 ![language("format_arguments")]
 public type struct Arguments {
 private:
-    pieces: virtual &FormatPieces;
+    /// The f-string's pieces; `None` for plain text.
+    pieces: Option<virtual &FormatPieces>;
+    /// The plain text, written when there are no pieces.
+    text: Str;
+
+public:
+    /// Plain text as the arguments that write it.  `![implicit]`, so a
+    /// literal is converted where an `Arguments` is declared.
+    ![implicit]
+    static from_text(text: string) -> Arguments {
+        return Arguments { pieces: Option::None, text: Str::new(text) };
+    }
+
+    /// A view as the arguments that write it.  `![implicit]`, so a `Str` is
+    /// converted where an `Arguments` is declared.
+    ![implicit]
+    static from_view(text: Str) -> Arguments {
+        return Arguments { pieces: Option::None, text: text };
+    }
 
 internal:
+    /// The plain text these arguments are, or `None` for an f-string's
+    /// pieces, which only a `Formatter` writes.
+    as_text(&this) -> Option<Str> {
+        return match (this.pieces) {
+            Option::Some(_) => { Option::None }
+            Option::None => { Option::Some(this.text) }
+        };
+    }
+
     /// Write the pieces through `f`, in the order the f-string has them,
-    /// stopping at the first that fails.  `FormatWrite.write` and
-    /// `Formatter.write` are how a program writes them.
+    /// stopping at the first that fails, or the plain text.
+    /// `FormatWrite.write` and `Formatter.write` are how a program writes
+    /// them.
     write_to(&this, f: mut &Formatter) -> Result<(), FormatError> {
-        return this.pieces.write_pieces(f);
+        return match (this.pieces) {
+            Option::Some(pieces) => { pieces.write_pieces(f) }
+            Option::None => { f.write_str(this.text) }
+        };
     }
 }
 
@@ -161,7 +197,7 @@ internal type trait FormatPieces {
 /// the pieces builders made.
 ![language("format_arguments_new")]
 internal function fmt_arguments_new(pieces: virtual &FormatPieces) -> Arguments {
-    return Arguments { pieces: pieces };
+    return Arguments { pieces: Option::Some(pieces), text: Str::new("") };
 }
 
 /// No pieces: what the first piece of an f-string follows.

@@ -19,7 +19,8 @@
 ///!   - `format`  - C-style variadic (`%s`/`%d`) into a new owned `String`.
 ///!   - `printf` / `eprintf` - C-style variadic (`%s`/`%d`) to stdout/stderr.
 ///!   - `print` / `println` / `eprint` / `eprintln` - Display-based: take an
-///!     owned `String` (typically an f-string `f"{x}"`), write it, and drop it.
+///!     `Arguments` - an f-string `f"{x}"`, a literal or a `Str` - and write
+///!     it; a `String` is passed as its view, `println(name.as_str())`.
 ///!   - `interpolation` - f-string (`f"...{expr}..."`) desugar runtime
 ///!
 ///! Integer formatting (`to_decimal_buffer`, `to_hex_buffer`, `to_octal_buffer`,
@@ -135,19 +136,48 @@ private function write_if_console(descriptor: i32, bytes: &Slice<u8>) -> boolean
     return true;
 }
 
-/// Write an already-formatted `String` (typically an f-string `f"{x}"`) to
-/// stdout, then drop it.  Display-based counterpart to `printf`: the f-string
-/// desugar already ran each `{expr}` through `Display`/`Debug`, so there is no
+/// The text `text` writes: its own plain text, or an f-string's pieces
+/// formatted into `rendered`, which the answer then views.  Panics when the
+/// formatting fails, as building any `String` does.
+private function text_of(text: Arguments, rendered: mut &String) -> Str {
+    match (text.as_text()) {
+        Option::Some(plain) => { return plain; }
+        Option::None => { }
+    }
+    match (rendered.write(text)) {
+        Result::Ok(_) => { }
+        Result::Err(_) => { panic("fmt::print: formatting failed", intrinsics::location()); }
+    }
+    return rendered.as_str();
+}
+
+/// Write `text` to stdout: an f-string (`print(f"{x}")`, its holes formatted
+/// through `Display`/`Debug`), a literal or a `Str`; a `String` is written
+/// as its view, `print(name.as_str())`.  Nothing is consumed.  There is no
 /// format string to interpret here (a `%` in the text is data, not a
-/// directive).  We go through the real stdout (`printf "%.*s"`) so output
+/// directive).  It goes through the real stdout (`printf "%.*s"`) so output
 /// stays interleaved with `printf` rather than landing on a second FILE*.
 /// `%s` stops at a zero byte even with a precision, so each run before an
 /// embedded zero is written by `%.*s` and the zero itself by `%c`.
-public function print(text: String) -> void {
+public function print(text: Arguments) -> void {
+    mut rendered: String = String::new();
+    write_stdout(text_of(text, &rendered));
+}
+
+/// Like `print`, followed by a newline.
+public function println(text: Arguments) -> void {
+    mut rendered: String = String::new();
+    write_stdout(text_of(text, &rendered));
+    if (!write_if_console(STDOUT_FILE_DESCRIPTOR, Str::new("\n").as_bytes())) {
+        libc::putchar(0x0A);
+    }
+}
+
+private function write_stdout(text: Str) -> void {
     if (write_if_console(STDOUT_FILE_DESCRIPTOR, text.as_bytes())) {
         return;
     }
-    mut rest: Str = text.as_str();
+    mut rest: Str = text;
     loop {
         match (rest.find_byte(0)) {
             Option::Some(at) => {
@@ -159,14 +189,6 @@ public function print(text: String) -> void {
                 return;
             }
         }
-    }
-}
-
-/// Like `print`, followed by a newline.
-public function println(text: String) -> void {
-    print(text);
-    if (!write_if_console(STDOUT_FILE_DESCRIPTOR, Str::new("\n").as_bytes())) {
-        libc::putchar(0x0A);
     }
 }
 
@@ -204,25 +226,30 @@ public function eprintf(fmt: string, args...) -> i32 {
     return n;
 }
 
-/// Write an already-formatted `String` (typically an f-string) to stderr,
-/// then drop it.  Display-based counterpart to `eprintf`.
-public function eprint(text: String) -> void {
-    if (write_if_console(STDERR_FILE_DESCRIPTOR, text.as_bytes())) {
+/// Write `text` to stderr, as `print` writes it to stdout: an f-string, a
+/// literal or a `Str`, nothing consumed.  Display-based counterpart to
+/// `eprintf`.
+public function eprint(text: Arguments) -> void {
+    mut rendered: String = String::new();
+    const view: Str = text_of(text, &rendered);
+    if (write_if_console(STDERR_FILE_DESCRIPTOR, view.as_bytes())) {
         return;
     }
     const stream: void* = fmt_stderr_stream();
-    libc::fwrite(text.as_pointer(), 1, text.length() as u64, stream);
+    libc::fwrite(view.as_pointer(), 1, view.length() as u64, stream);
     libc::fflush(stream);
 }
 
 /// Like `eprint`, followed by a newline.
-public function eprintln(text: String) -> void {
-    if (write_if_console(STDERR_FILE_DESCRIPTOR, text.as_bytes())) {
+public function eprintln(text: Arguments) -> void {
+    mut rendered: String = String::new();
+    const view: Str = text_of(text, &rendered);
+    if (write_if_console(STDERR_FILE_DESCRIPTOR, view.as_bytes())) {
         write_if_console(STDERR_FILE_DESCRIPTOR, Str::new("\n").as_bytes());
         return;
     }
     const stream: void* = fmt_stderr_stream();
-    libc::fwrite(text.as_pointer(), 1, text.length() as u64, stream);
+    libc::fwrite(view.as_pointer(), 1, view.length() as u64, stream);
     libc::fputc(0x0A, stream);
     libc::fflush(stream);
 }
