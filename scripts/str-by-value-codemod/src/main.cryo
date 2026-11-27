@@ -1,0 +1,379 @@
+///! One-off codemod for the change that makes `Str`'s text methods take
+///! their text parameter by value.  For every call `.M(...)` where `M` is
+///! one of those methods, an argument written `&Str::new("literal")`
+///! becomes `"literal"` (the literal converter makes the `Str`), and any
+///! other `&Str::new(x)` becomes `Str::new(x)`.  Arguments written another
+///! way are left for the compiler to point at.  Rewrites each file named
+///! on the command line in place and prints how many arguments it changed.
+
+import std::core::option::{ Option };
+import std::core::result::{ Result };
+import std::collections::array::{ Array };
+import std::collections::str::{ Str };
+import std::collections::string::{ String };
+import std::env;
+import std::fmt::{ println, eprintln };
+import std::fs::{ File, Path };
+
+type struct Frame {
+    target: boolean;
+}
+
+type struct Codemod {
+    text: Str;
+    out: String;
+    at: i64;
+    frames: Array<Frame>;
+    argument_start: boolean;
+    changed: i64;
+
+    static methods() -> Array<Str> {
+        mut names: Array<Str> = Array::<Str>::new();
+        names.push(Str::new("starts_with"));
+        names.push(Str::new("ends_with"));
+        names.push(Str::new("find"));
+        names.push(Str::new("find_last"));
+        names.push(Str::new("split_once"));
+        names.push(Str::new("split_once_from_end"));
+        names.push(Str::new("strip_prefix"));
+        names.push(Str::new("strip_suffix"));
+        names.push(Str::new("common_prefix_length"));
+        names.push(Str::new("replace"));
+        names.push(Str::new("equals_case_insensitive"));
+        names.push(Str::new("contains"));
+        names.push(Str::new("split"));
+        names.push(Str::new("split_nonempty"));
+        return names;
+    }
+
+    byte(&this, index: i64) -> u8 {
+        return match (this.text.byte_at(index)) {
+            Option::Some(b) => { b }
+            Option::None => { 0 }
+        };
+    }
+
+    static is_identifier_byte(b: u8) -> boolean {
+        return (b >= 'a' as u8 && b <= 'z' as u8) || (b >= 'A' as u8 && b <= 'Z' as u8)
+            || (b >= '0' as u8 && b <= '9' as u8) || b == '_' as u8;
+    }
+
+    /// True when the bytes at `index` spell `word`.
+    spells(&this, index: i64, word: Str) -> boolean {
+        if (index + word.length() > this.text.length()) { return false; }
+        return this.text.byte_substring(index, index + word.length()) == word;
+    }
+
+    /// True when the `(` at `open` follows `.M` for one of the methods.
+    opens_target_call(&this, open: i64) -> boolean {
+        mut start: i64 = open;
+        while (start > 0 && Codemod::is_identifier_byte(this.byte(start - 1))) { start--; }
+        if (start == open || start == 0 || this.byte(start - 1) != '.' as u8) { return false; }
+        const name: Str = this.text.byte_substring(start, open);
+        const names: Array<Str> = Codemod::methods();
+        mut i: i64 = 0;
+        while (i < names.length()) {
+            if (names[i] == name) { return true; }
+            i++;
+        }
+        return false;
+    }
+
+    copy_byte(mut &this) -> void {
+        this.out.push_byte(this.byte(this.at));
+        this.at++;
+    }
+
+    /// Copy a quoted literal starting at `this.at` through its closing quote.
+    copy_quoted(mut &this, quote: u8) -> void {
+        this.copy_byte();
+        while (this.at < this.text.length()) {
+            const b: u8 = this.byte(this.at);
+            if (b == '\\' as u8) {
+                this.copy_byte();
+                this.copy_byte();
+                continue;
+            }
+            this.copy_byte();
+            if (b == quote) { return; }
+        }
+    }
+
+    /// End index (exclusive) of the string literal starting at `index`, or -1.
+    literal_end(&this, index: i64) -> i64 {
+        if (this.byte(index) != '"' as u8) { return -1; }
+        mut i: i64 = index + 1;
+        while (i < this.text.length()) {
+            const b: u8 = this.byte(i);
+            if (b == '\\' as u8) { i = i + 2; continue; }
+            if (b == '"' as u8) { return i + 1; }
+            if (b == '\n' as u8) { return -1; }
+            i++;
+        }
+        return -1;
+    }
+
+    /// True when the next byte past whitespace at `index` ends an argument.
+    ends_argument(&this, index: i64) -> boolean {
+        mut i: i64 = index;
+        while (this.byte(i) == ' ' as u8 || this.byte(i) == '\n' as u8 || this.byte(i) == '\r' as u8) { i++; }
+        return this.byte(i) == ',' as u8 || this.byte(i) == ')' as u8;
+    }
+
+    /// At an argument's first byte: rewrite `&Str::new(...)`.
+    rewrite_argument(mut &this) -> void {
+        const prefix: Str = Str::new("&Str::new(");
+        if (!this.spells(this.at, prefix)) { return; }
+        const inner: i64 = this.at + prefix.length();
+        const end: i64 = this.literal_end(inner);
+        if (end > 0 && this.byte(end) == ')' as u8 && this.ends_argument(end + 1)) {
+            this.out.append(this.text.byte_substring(inner, end));
+            this.at = end + 1;
+        } else {
+            this.out.append(Str::new("Str::new"));
+            this.at = inner - 1;
+        }
+        this.changed++;
+    }
+
+    run(mut &this) -> void {
+        while (this.at < this.text.length()) {
+            const b: u8 = this.byte(this.at);
+            if (this.argument_start) {
+                if (b == ' ' as u8 || b == '\n' as u8 || b == '\r' as u8 || b == '\t' as u8) {
+                    this.copy_byte();
+                    continue;
+                }
+                this.argument_start = false;
+                this.rewrite_argument();
+                continue;
+            }
+            if (b == '/' as u8 && this.byte(this.at + 1) == '/' as u8) {
+                while (this.at < this.text.length() && this.byte(this.at) != '\n' as u8) { this.copy_byte(); }
+                continue;
+            }
+            if (b == '"' as u8 || b == '\'' as u8) {
+                this.copy_quoted(b);
+                continue;
+            }
+            if (b == '(' as u8 || b == '[' as u8 || b == '{' as u8) {
+                const target: boolean = b == '(' as u8 && this.opens_target_call(this.at);
+                this.frames.push(Frame { target: target });
+                this.copy_byte();
+                if (target) { this.argument_start = true; }
+                continue;
+            }
+            if (b == ')' as u8 || b == ']' as u8 || b == '}' as u8) {
+                if (this.frames.length() > 0) { this.frames.pop(); }
+                this.copy_byte();
+                continue;
+            }
+            if (b == ',' as u8 && this.frames.length() > 0 && this.frames[this.frames.length() - 1].target) {
+                this.copy_byte();
+                this.argument_start = true;
+                continue;
+            }
+            this.copy_byte();
+        }
+    }
+
+    static rewrite(path: Str) -> i64 {
+        const source: String = match (File::read_text(Path::from(path))) {
+            Result::Ok(text) => { text }
+            Result::Err(e) => {
+                eprintln(f"str-by-value-codemod: cannot read {path}: {e}");
+                return -1;
+            }
+        };
+        mut codemod: Codemod = Codemod {
+            text: source.as_str(),
+            out: String::with_capacity(source.length()),
+            at: 0,
+            frames: Array::<Frame>::new(),
+            argument_start: false,
+            changed: 0,
+        };
+        codemod.run();
+        if (codemod.changed == 0) { return 0; }
+        match (File::write_text(Path::from(path), codemod.out.as_str())) {
+            Result::Ok(_) => { }
+            Result::Err(e) => {
+                eprintln(f"str-by-value-codemod: cannot write {path}: {e}");
+                return -1;
+            }
+        }
+        return codemod.changed;
+    }
+}
+
+/// The second pass: a build log's `no method named M` errors, each at a
+/// call of one of the methods whose argument is still a reference.
+type struct LogPass {
+    /// Drop the `&` of every argument of the call whose method name starts
+    /// at (`line`, `column`) in `path`; the count dropped.
+    static drop_references(path: Str, line: i64, column: i64) -> i64 {
+        const source: String = match (File::read_text(Path::from(path))) {
+            Result::Ok(text) => { text }
+            Result::Err(e) => {
+                eprintln(f"str-by-value-codemod: cannot read {path}: {e}");
+                return -1;
+            }
+        };
+        const text: Str = source.as_str();
+        mut at: i64 = 0;
+        mut current: i64 = 1;
+        while (current < line && at < text.length()) {
+            if (text.byte_at(at).unwrap() == '\n' as u8) { current++; }
+            at++;
+        }
+        at = at + column - 1;
+        while (at < text.length() && Codemod::is_identifier_byte(text.byte_at(at).unwrap())) { at++; }
+        if (at >= text.length() || text.byte_at(at).unwrap() != '(' as u8) { return 0; }
+        mut out: String = String::with_capacity(text.length());
+        out.append(text.byte_substring(0, at + 1));
+        mut depth: i64 = 0;
+        mut i: i64 = at + 1;
+        mut argument_start: boolean = true;
+        mut dropped: i64 = 0;
+        while (i < text.length()) {
+            const b: u8 = text.byte_at(i).unwrap();
+            if (argument_start && (b == ' ' as u8 || b == '\n' as u8 || b == '\r' as u8)) {
+                out.push_byte(b);
+                i++;
+                continue;
+            }
+            if (argument_start) {
+                argument_start = false;
+                if (b == '&' as u8) { dropped++; i++; continue; }
+            }
+            if (b == '(' as u8 || b == '[' as u8 || b == '{' as u8) { depth++; }
+            if (b == ')' as u8 || b == ']' as u8 || b == '}' as u8) {
+                if (depth == 0) { break; }
+                depth--;
+            }
+            if (b == ',' as u8 && depth == 0) { argument_start = true; }
+            out.push_byte(b);
+            i++;
+        }
+        out.append(text.byte_substring(i, text.length()));
+        if (dropped == 0) { return 0; }
+        match (File::write_text(Path::from(path), out.as_str())) {
+            Result::Ok(_) => { }
+            Result::Err(e) => {
+                eprintln(f"str-by-value-codemod: cannot write {path}: {e}");
+                return -1;
+            }
+        }
+        return dropped;
+    }
+
+    static number(text: Str) -> i64 {
+        mut value: i64 = 0;
+        mut i: i64 = 0;
+        while (i < text.length()) {
+            const b: u8 = text.byte_at(i).unwrap();
+            if (b < '0' as u8 || b > '9' as u8) { break; }
+            value = value * 10 + (b - '0' as u8) as i64;
+            i++;
+        }
+        return value;
+    }
+
+    /// Every `--> file:line:column` following a `no method named` error for
+    /// one of the methods, joined to `base`.
+    static run(base: Str, log_path: Str) -> i32 {
+        const log: String = match (File::read_text(Path::from(log_path))) {
+            Result::Ok(text) => { text }
+            Result::Err(e) => {
+                eprintln(f"str-by-value-codemod: cannot read {log_path}: {e}");
+                return 1;
+            }
+        };
+        const names: Array<Str> = Codemod::methods();
+        const text: Str = log.as_str();
+        mut pending: boolean = false;
+        mut total: i64 = 0;
+        mut files: Array<String> = Array::<String>::new();
+        mut lines: Array<i64> = Array::<i64>::new();
+        mut columns: Array<i64> = Array::<i64>::new();
+        mut directory: String = String::from_str(base);
+        mut start: i64 = 0;
+        while (start < text.length()) {
+            mut end: i64 = start;
+            while (end < text.length() && text.byte_at(end).unwrap() != '\n' as u8) { end++; }
+            mut line: Str = text.byte_substring(start, end);
+            if (line.length() > 0 && line.byte_at(line.length() - 1).unwrap() == '\r' as u8) {
+                line = line.byte_substring(0, line.length() - 1);
+            }
+            start = end + 1;
+            // A log of several builds names each one's directory under `base`.
+            const heading: Str = Str::new("=== TOOL ");
+            if (line.length() > heading.length() && line.byte_substring(0, heading.length()) == heading) {
+                directory = String::from_str(base);
+                directory.append(Str::new("/"));
+                directory.append(line.byte_substring(heading.length(), line.length()));
+                continue;
+            }
+            const marker: Str = Str::new("error[E0358]: no method named `");
+            if (line.length() > marker.length() && line.byte_substring(0, marker.length()) == marker) {
+                mut name_end: i64 = marker.length();
+                while (name_end < line.length() && line.byte_at(name_end).unwrap() != '`' as u8) { name_end++; }
+                const name: Str = line.byte_substring(marker.length(), name_end);
+                pending = false;
+                mut k: i64 = 0;
+                while (k < names.length()) {
+                    if (names[k] == name) { pending = true; }
+                    k++;
+                }
+                continue;
+            }
+            const arrow: Str = Str::new(" --> ");
+            if (pending && line.length() > arrow.length() && line.byte_substring(0, arrow.length()) == arrow) {
+                pending = false;
+                const location: Str = line.byte_substring(arrow.length(), line.length());
+                mut colon2: i64 = location.length() - 1;
+                while (colon2 > 0 && location.byte_at(colon2).unwrap() != ':' as u8) { colon2--; }
+                mut colon1: i64 = colon2 - 1;
+                while (colon1 > 0 && location.byte_at(colon1).unwrap() != ':' as u8) { colon1--; }
+                const file: Str = location.byte_substring(0, colon1);
+                const line_number: i64 = LogPass::number(location.byte_substring(colon1 + 1, colon2));
+                const column: i64 = LogPass::number(location.byte_substring(colon2 + 1, location.length()));
+                mut full: String = String::from_str(directory.as_str());
+                full.append(Str::new("/"));
+                full.append(file);
+                files.push(full);
+                lines.push(line_number);
+                columns.push(column);
+            }
+        }
+        // Last first, so an edit never moves a column still to be visited.
+        mut index: i64 = files.length() - 1;
+        while (index >= 0) {
+            const dropped: i64 = LogPass::drop_references(files[index].as_str(), lines[index], columns[index]);
+            if (dropped < 0) { return 1; }
+            total = total + dropped;
+            index--;
+        }
+        println(f"str-by-value-codemod: dropped {total} references");
+        return 0;
+    }
+}
+
+function main() -> i32 {
+    const arguments: Array<String> = env::args();
+    if (arguments.length() == 4 && arguments[1].as_str() == Str::new("--log")) {
+        return LogPass::run(arguments[2].as_str(), arguments[3].as_str());
+    }
+    mut total: i64 = 0;
+    mut files: i64 = 0;
+    mut i: i64 = 1;
+    while (i < arguments.length()) {
+        const changed: i64 = Codemod::rewrite(arguments[i].as_str());
+        if (changed < 0) { return 1; }
+        if (changed > 0) { files++; }
+        total = total + changed;
+        i++;
+    }
+    println(f"str-by-value-codemod: {total} arguments in {files} files");
+    return 0;
+}

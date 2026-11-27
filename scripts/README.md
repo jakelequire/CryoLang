@@ -36,3 +36,4 @@ Every gate is a `cryogate` subcommand (`tools/CryoGate`); none is a script.
 | script | what it does | called by |
 |---|---|---|
 | `install-lsp-windows.cmd` | Windows host: packages `tools/CryoAnalyzer` and installs it into VS Code, replacing the installed extension; the server itself is built, installed and checked by `make install-lsp` before it runs | `make install-lsp` (Windows) |
+| `str-by-value-codemod/` | One-off, deleted in the next commit: a Cryo program that rewrites the `&Str::new(...)` arguments of `Str`'s text methods to by-value ones in the files it is given, and with `--log <dir> <build log>` drops the `&` of every argument of each call a build refused | the person running the migration |
