@@ -45,3 +45,9 @@ look for as a `Str`, so a literal is passed as it is:
 `line.starts_with("#")`, `text.replace("\\", "/")`. A `String` is passed as
 its view, `name.as_str()`. The raw `string` type is a NUL-terminated C
 string; `Str::new(text)` reads one.
+
+Output goes through the print family with an f-string,
+`fmt::println(f"{name}: {count}")`, and a `Str` is matched against string
+patterns directly: `match (command) { "start" | "go" => ..., _ => ... }`.
+The `examples/` directory at the repository root is written this way
+throughout.

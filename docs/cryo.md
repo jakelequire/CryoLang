@@ -5221,6 +5221,7 @@ Several standard library types implement the operator traits (§10.6):
 The standard library follows a small set of conventions that user code is encouraged to mirror.
 
 - **No NUL-terminated strings outside `ffi/`.** Every other module works in `Str` and `String`, and turns a C string into one at the boundary (`Str::new`, `String::with_null` / `as_c_string`).
+- **Text in as `Str`, text out as `String`.** A function that reads text takes it as a `Str` by value, so a literal is passed as written (`line.starts_with("#")`, `Response::text(status, "ok\n")`) and a `String` as its view (`name.as_str()`); one that builds text returns a `String`. Output is written with an f-string (`println(f"{name}: {count}")`), and a `Str` is matched against string patterns directly ([section 7.1](#71-pattern-forms)).
 - **`Result` for fallible operations, `panic` for broken invariants.** A function returns `Result<T, E>` whenever failure is part of its contract; it panics only when the contract truly cannot be preserved (e.g., an out-of-bounds index on a function whose contract excludes it).
 - **Explicit resource management.** Every owning type implements `Drop` (`implement trait Drop for ...`), and its docstring identifies the ownership obligation. The compiler runs these destructors at scope exit (see [section 15.2](#152-the-drop-trait)); to release a value early, call `mem::drop(x)`; `x.drop()` is refused (E0453).
 - **Allocator-generic containers.** `Array<T>`, `HashMap<K, V>`, `String`, etc. accept any `Allocator` implementation, defaulting to `GlobalAllocator`.

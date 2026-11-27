@@ -12,13 +12,15 @@
 ///!     fluent registration of route handlers.
 ///!   - Free-function handlers with the signature
 ///!     `(Request) -> Response` - Cryo's first-class function values.
-///!   - `Response::text` / `Response::json` constructors, and the
-///!     drop discipline at the end of every handler.
+///!   - `Response::text` / `Response::json` constructors; a handler's
+///!     request is released when the handler returns.
 ///!   - `HttpServer::with_router(addr, &router)` + `await .run()`, which
 ///!     is why `main` is an `async function`: the accept loop and every
 ///!     connection read run on the executor `async main` sets up.
 ///!
 ///! Run with:  cryo run    then  curl http://127.0.0.1:8080/
+///!
+///! `net::http` is a preview module: its shape may change in a 1.x release.
 
 namespace Main;
 
@@ -32,14 +34,11 @@ import std::net::http::{ HttpServer, Request, Response, Router, StatusCode };
 // ============================================================================
 
 function handle_root(req: Request) -> Response {
-    return Response::text(
-        StatusCode::ok(),
-        Str::new("Hello from the Cryo HTTP server!\n")
-    );
+    return Response::text(StatusCode::ok(), "Hello from the Cryo HTTP server!\n");
 }
 
 function handle_health(req: Request) -> Response {
-    const body_text: Str = Str::new("{\"status\":\"ok\"}");
+    const body_text: Str = "{\"status\":\"ok\"}";
     mut body: Array<u8> = Array::with_capacity(body_text.length());
     body.append(body_text.as_bytes());
     return Response::json(StatusCode::ok(), body);
@@ -48,59 +47,36 @@ function handle_health(req: Request) -> Response {
 /// GET /greet/:name - pull the `:name` segment out of `req.params`
 /// and bake it into a personalized response.
 ///
-/// We use `params.get_reference` to take a *borrow* of the captured value
-/// rather than a copy - the captured String stays owned by the
-/// request's HashMap and is released by `req_local.drop()`.
+/// `params.get_reference` borrows the captured value rather than copying
+/// it: the captured String stays owned by the request's map.
 function handle_greet(req: Request) -> Response {
-    mut req_local: Request = req;
-    const key: String = String::from_str(Str::new("name"));
-    const looked_up: Option<String*> = req_local.params.get_reference(&key);
-    // `key` is a local String - auto-dropped on scope exit.
-
-    match (looked_up) {
-        Option::Some(name_ptr) => {
-            mut body: Array<u8> = Array::with_capacity(64);
-            body.append(Str::new("Hello, ").as_bytes());
-            body.append(name_ptr.as_str().as_bytes());
-            body.append(Str::new("!\n").as_bytes());
-            const resp: Response = Response::text(
-                StatusCode::ok(),
-                Str::from_raw(body.as_pointer(), body.length())
-            );
-            return resp;
+    const key: String = String::from_str("name");
+    match (req.params.get_reference(&key)) {
+        Option::Some(name) => {
+            const greeting: String = f"Hello, {name.as_str()}!\n";
+            return Response::text(StatusCode::ok(), greeting.as_str());
         }
         Option::None => {
-            return Response::text(
-                StatusCode::internal_server_error(),
-                Str::new("missing :name param\n")
-            );
+            return Response::text(StatusCode::internal_server_error(), "missing :name param\n");
         }
     }
 }
 
 /// POST /echo - mirror the request body back as text/plain.
 function handle_echo(req: Request) -> Response {
-    mut req_local: Request = req;
-    const body_view: Str = Str::from_raw(
-        req_local.body.as_pointer(),
-        req_local.body.length()
-    );
-    const resp: Response = Response::text(StatusCode::ok(), body_view);
-    return resp;
+    const body_view: Str = Str::from_raw(req.body.as_pointer(), req.body.length());
+    return Response::text(StatusCode::ok(), body_view);
 }
 
 function handle_not_found(req: Request) -> Response {
     return Response::text(
         StatusCode::not_found(),
-        Str::new("404 Not Found\n  Try GET /, /health, /greet/:name, or POST /echo\n")
+        "404 Not Found\n  Try GET /, /health, /greet/:name, or POST /echo\n"
     );
 }
 
 function handle_method_not_allowed(req: Request) -> Response {
-    return Response::text(
-        StatusCode::method_not_allowed(),
-        Str::new("405 Method Not Allowed\n")
-    );
+    return Response::text(StatusCode::method_not_allowed(), "405 Method Not Allowed\n");
 }
 
 // ============================================================================
@@ -108,12 +84,12 @@ function handle_method_not_allowed(req: Request) -> Response {
 // ============================================================================
 
 function on_ready() -> void {
-    fmt::printf("listening on http://127.0.0.1:8080\n");
-    fmt::printf("  GET  /              -> greeting\n");
-    fmt::printf("  GET  /health        -> {\"status\":\"ok\"}\n");
-    fmt::printf("  GET  /greet/:name   -> personalized greeting\n");
-    fmt::printf("  POST /echo          -> echoes the body\n");
-    fmt::printf("  (Ctrl-C to stop)\n");
+    fmt::println("listening on http://127.0.0.1:8080");
+    fmt::println("  GET  /              -> greeting");
+    fmt::println("  GET  /health        -> {\"status\":\"ok\"}");
+    fmt::println("  GET  /greet/:name   -> personalized greeting");
+    fmt::println("  POST /echo          -> echoes the body");
+    fmt::println("  (Ctrl-C to stop)");
 }
 
 // ============================================================================
@@ -124,10 +100,10 @@ async function main() -> i32 {
     const addr: SocketAddress = SocketAddress::localhost_v4(8080);
 
     mut router: Router = Router::new();
-    router.get(Str::new("/"),               handle_root)
-          .get(Str::new("/health"),         handle_health)
-          .get(Str::new("/greet/:name"),    handle_greet)
-          .post(Str::new("/echo"),          handle_echo)
+    router.get("/",               handle_root)
+          .get("/health",         handle_health)
+          .get("/greet/:name",    handle_greet)
+          .post("/echo",          handle_echo)
           .on_not_found(handle_not_found)
           .on_method_not_allowed(handle_method_not_allowed);
 
@@ -137,7 +113,7 @@ async function main() -> i32 {
     match (await server.run()) {
         Result::Ok(_) => { }
         Result::Err(_) => {
-            fmt::printf("server error: could not bind 127.0.0.1:8080\n");
+            fmt::println("server error: could not bind 127.0.0.1:8080");
             return 1;
         }
     }

@@ -1,28 +1,25 @@
-///! JSON config - `std::encoding::json` parsing with a generic
-///! `TryFrom<&Value>` getter.
+///! JSON config - `std::encoding::json` parsing into typed structs with
+///! a derived `FromValue`.
 ///!
-///! Loads `data/server.json`, parses it into a `Value`, and walks
-///! the tree to extract a small set of fields into a strongly-typed
-///! `ServerConfig`.
+///! Loads `data/server.json`, parses it into a `Value`, and reads that
+///! tree into a strongly-typed `ServerConfig`.
 ///!
 ///! What this example demonstrates:
 ///!   - `json::Json::parse(Str)` returns `Result<Value, JsonError>`.
-///!   - `TryFrom<&Value>` - the stdlib implements it for
-///!     `boolean`, `i64`, `u64`, `f64`, and `Str`. Third-party types
-///!     can implement it to slot into the same machinery.
-///!   - One generic `get_or<T>` for every field type:
-///!         get_or(&value, key, fallback)             -> T
-///!     Nested objects are reached with `Value::get` (a `Value*`),
-///!     then read with the same `&Value` getters.
-///!   - Walking a JSON array of strings via `Value::length` + `at`.
+///!   - `with [FromValue]` derives the reading of a struct from a JSON
+///!     object: each field from the member of its name, through the
+///!     field type's own `from_value` - a nested struct, an
+///!     `Array<String>`, an integer of any width.
+///!   - Members the struct does not name (`version`, `owner`) are
+///!     ignored, and one it names and the file lacks is refused with an
+///!     error that says where (`at .server.port: ...`).
 ///!
 ///! Run with:  cryo run
 
 namespace Main;
 
-import std::core::convert::{ TryFrom };
 import std::fs::{ File };
-import std::encoding::value::{ Value };
+import std::encoding::value::{ FromValue, Value, ValueDecodeError };
 import std::encoding::json;
 import std::fmt;
 
@@ -30,126 +27,22 @@ import std::fmt;
 // The typed shape we want
 // ============================================================================
 
-type struct ServerConfig {
-    service: String;
+type struct ServerBlock with [FromValue] {
     host: String;
     port: u16;
     tls: boolean;
+}
+
+type struct Limits with [FromValue] {
     max_connections: u32;
     timeout_seconds: u32;
+}
+
+type struct ServerConfig with [FromValue] {
+    service: String;
+    server: ServerBlock;
+    limits: Limits;
     features: Array<String>;
-}
-
-// ============================================================================
-// Getter
-//
-// `get_or<T>` covers every field type `TryFrom<&Value>` is implemented
-// for - `boolean`, `i64`, `u64`, `f64` and `Str` in `std::encoding::value`.
-// `T::try_from` is resolved to the concrete implementation for each `T`
-// the getter is called with.
-// ============================================================================
-
-function get_or<T>(parent: &Value, key: Str, fallback: T) -> T
-where T: TryFrom<&Value> {
-    match (parent.get(key)) {
-        Option::Some(value_ptr) => {
-            return T::try_from(value_ptr).unwrap_or(fallback);
-        }
-        Option::None => { return fallback; }
-    }
-}
-
-// ============================================================================
-// Read an array of strings into an owned `Array<String>`. Returns an
-// empty array if `key` is missing or not a string array.
-// ============================================================================
-
-function read_string_array(parent: &Value, key: Str) -> Array<String> {
-    mut out: Array<String> = Array::new();
-    // `get` returns a `Value*` into stable heap storage; walk it with
-    // `length` + `at` (both return through that stable pointer) rather than
-    // borrowing the inline `Array` payload, which can't be returned safely.
-    match (parent.get(key)) {
-        Option::Some(arr_val) => {
-            const n: i64 = arr_val.length();
-            mut i: i64 = 0;
-            while (i < n) {
-                match (arr_val.at(i)) {
-                    Option::Some(element_ptr) => {
-                        match (element_ptr.as::<Str>()) {
-                            Option::Some(view) => {
-                                out.push(String::from_str(view));
-                            }
-                            Option::None => { }
-                        }
-                    }
-                    Option::None => { }
-                }
-                i = i + 1;
-            }
-        }
-        Option::None => { }
-    }
-    return out;
-}
-
-// ============================================================================
-// Build the typed config from the parsed value
-// ============================================================================
-
-function build_config(root: &Value) -> ServerConfig {
-    // Top-level Str field - direct extractor.
-    mut service: String = String::from_str(
-        get_or(root, Str::new("service"), Str::new("unknown"))
-    );
-
-    // Nested `server` block - descend once with `get` (a `Value*`
-    // into stable heap storage), then read fields off that value with the
-    // same `&Value` getters used at the top level.
-    mut host: String;
-    mut port: u16;
-    mut tls:  boolean;
-    match (root.get(Str::new("server"))) {
-        Option::Some(server) => {
-            host = String::from_str(
-                get_or(server, Str::new("host"), Str::new("127.0.0.1"))
-            );
-            port = get_or(server, Str::new("port"), 8080 as u64) as u16;
-            tls  = get_or(server, Str::new("tls"), false);
-        }
-        Option::None => {
-            fmt::printf("  (warn) 'server' block missing; using defaults\n");
-            host = String::from_str(Str::new("127.0.0.1"));
-            port = 8080;
-            tls  = false;
-        }
-    }
-
-    mut max_connections: u32;
-    mut timeout_seconds: u32;
-    match (root.get(Str::new("limits"))) {
-        Option::Some(limits) => {
-            max_connections = get_or(limits, Str::new("max_connections"), 64 as u64) as u32;
-            timeout_seconds = get_or(limits, Str::new("timeout_seconds"), 30 as u64) as u32;
-        }
-        Option::None => {
-            fmt::printf("  (warn) 'limits' block missing; using defaults\n");
-            max_connections = 64;
-            timeout_seconds = 30;
-        }
-    }
-
-    mut features: Array<String> = read_string_array(root, Str::new("features"));
-
-    return ServerConfig {
-        service: service,
-        host: host,
-        port: port,
-        tls: tls,
-        max_connections: max_connections,
-        timeout_seconds: timeout_seconds,
-        features: features
-    };
 }
 
 // ============================================================================
@@ -157,34 +50,20 @@ function build_config(root: &Value) -> ServerConfig {
 // ============================================================================
 
 function print_config(c: &ServerConfig) -> void {
-    fmt::printf("\nLoaded config:\n");
-    fmt::printf("  service          : %.*s\n",
-                       c.service.length() as i32, c.service.as_pointer());
-    fmt::printf("  host:port        : %.*s:%u\n",
-                       c.host.length() as i32, c.host.as_pointer(), c.port as u32);
-    if (c.tls) {
-        fmt::printf("  tls              : enabled\n");
-    } else {
-        fmt::printf("  tls              : disabled\n");
-    }
-    fmt::printf("  max_connections  : %u\n", c.max_connections);
-    fmt::printf("  timeout_seconds  : %u\n", c.timeout_seconds);
+    fmt::println("\nLoaded config:");
+    fmt::println(f"  service          : {c.service}");
+    fmt::println(f"  host:port        : {c.server.host}:{c.server.port}");
+    const tls: Str = if (c.server.tls) { "enabled" } else { "disabled" };
+    fmt::println(f"  tls              : {tls}");
+    fmt::println(f"  max_connections  : {c.limits.max_connections}");
+    fmt::println(f"  timeout_seconds  : {c.limits.timeout_seconds}");
 
-    fmt::printf("  features         : [");
-    const n: i64 = c.features.length();
-    mut i: i64 = 0;
-    while (i < n) {
-        match (c.features.get_reference(i)) {
-            Option::Some(feat) => {
-                if (i > 0) { fmt::printf(", "); }
-                fmt::printf("%.*s",
-                    feat.length() as i32, feat.as_pointer());
-            }
-            Option::None => { }
-        }
-        i = i + 1;
+    mut features: String = String::new();
+    for (feature in c.features.iterate_references()) {
+        if (!features.is_empty()) { features.append(", "); }
+        features.append(feature.as_str());
     }
-    fmt::printf("]\n");
+    fmt::println(f"  features         : [{features}]");
 }
 
 // ============================================================================
@@ -192,20 +71,26 @@ function print_config(c: &ServerConfig) -> void {
 // ============================================================================
 
 function main() -> int {
-    fmt::printf("Reading %s...\n", "data/server.json");
+    fmt::println("Reading data/server.json...");
 
     match (File::read_text("data/server.json")) {
         Result::Ok(source) => {
-            fmt::printf("Parsing...\n");
+            fmt::println("Parsing...");
             match (json::Json::parse(source.as_str())) {
-                Result::Ok(value) => {
-                    mut root: Value = value;
-                    mut cfg: ServerConfig = build_config(&root);
-                    print_config(&cfg);
-                    return 0;
+                Result::Ok(root) => {
+                    match (ServerConfig::from_value(&root)) {
+                        Result::Ok(config) => {
+                            print_config(&config);
+                            return 0;
+                        }
+                        Result::Err(error) => {
+                            fmt::println(f"error: {error}");
+                            return 1;
+                        }
+                    }
                 }
                 Result::Err(_) => {
-                    fmt::printf("error: failed to parse JSON\n");
+                    fmt::println("error: failed to parse JSON");
                     return 1;
                 }
             }
