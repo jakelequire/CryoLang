@@ -21,6 +21,7 @@ import std::core::option::{ Option };
 import std::core::result::{ Result };
 import std::core::cmp::{ Eq };
 import std::core::hash::{ Hash, Hasher, SipHasher };
+import std::core::borrow::{ Borrow };
 import std::core::drop::{ Drop };
 import std::core::clone::{ Clone };
 import std::core::default::{ Default };
@@ -288,9 +289,10 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
         };
     }
 
-    /// True when the map holds `key`.
-    public contains_key(&this, key: &K) -> boolean
-    where K: Hash + Eq, H: Hasher + Copy {
+    /// True when the map holds `key`: a `&K`, or any form `K` borrows as
+    /// (`Borrow`), a `Str` for a `String` key.
+    public contains_key<Q>(&this, key: Q) -> boolean
+    where K: Hash + Eq + Borrow<Q>, Q: Hash + Eq, H: Hasher + Copy {
         // Borrow rather than copy out, so this stays sound for owning V
         // (a `where V: Copy` on `get` would otherwise leak in here).
         return this.get_reference(key).is_some();
@@ -300,18 +302,19 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     /// `V: Copy` for the same reason as `Array::get`: handing back a
     /// duplicate of an owning value would alias storage the map still
     /// owns, double-freeing on drop. For owning `V`, borrow in place
-    /// with `get_reference` (or move it out with `remove`).
-    public get(&this, key: &K) -> Option<V>
-    where K: Hash + Eq, V: Copy, H: Hasher + Copy {
+    /// with `get_reference` (or move it out with `remove`). `key` is a `&K`,
+    /// or any form `K` borrows as (`Borrow`): a `Str` for a `String` key.
+    public get<Q>(&this, key: Q) -> Option<V>
+    where K: Hash + Eq + Borrow<Q>, Q: Hash + Eq, V: Copy, H: Hasher + Copy {
         if (this.bucket_count == 0) {
             return Option::None;
         }
-        const h: u64 = hash_key(key, this.hasher);
+        const h: u64 = hash_key(&key, this.hasher);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: Entry<K, V>* = this.buckets[index];
         loop {
             if (node == null) { break; }
-            if (node.hash == h && node.key.equals(key)) {
+            if (node.hash == h && node.key.borrow().equals(&key)) {
                 return Option::Some(node.value);
             }
             node = node.next;
@@ -328,17 +331,17 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     /// removes this key or drops the map.  `resize_buckets` is safe;
     /// it relinks bucket heads but never relocates entry storage,
     /// because each entry is its own heap allocation.
-    public get_reference(&this, key: &K) -> Option<V*>
-    where K: Hash + Eq, H: Hasher + Copy {
+    public get_reference<Q>(&this, key: Q) -> Option<V*>
+    where K: Hash + Eq + Borrow<Q>, Q: Hash + Eq, H: Hasher + Copy {
         if (this.bucket_count == 0) {
             return Option::None;
         }
-        const h: u64 = hash_key(key, this.hasher);
+        const h: u64 = hash_key(&key, this.hasher);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: Entry<K, V>* = this.buckets[index];
         loop {
             if (node == null) { break; }
-            if (node.hash == h && node.key.equals(key)) {
+            if (node.hash == h && node.key.borrow().equals(&key)) {
                 return Option::Some(&node.value);
             }
             node = node.next;
@@ -348,17 +351,17 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
 
     /// Like `get_reference`, but the borrow is writable: change the stored
     /// value in place through it.  Valid for as long as `get_reference`'s.
-    public get_mutable(mut &this, key: &K) -> Option<mut V*>
-    where K: Hash + Eq, H: Hasher + Copy {
+    public get_mutable<Q>(mut &this, key: Q) -> Option<mut V*>
+    where K: Hash + Eq + Borrow<Q>, Q: Hash + Eq, H: Hasher + Copy {
         if (this.bucket_count == 0) {
             return Option::None;
         }
-        const h: u64 = hash_key(key, this.hasher);
+        const h: u64 = hash_key(&key, this.hasher);
         const index: u64 = h & (this.bucket_count - 1);
         mut node: mut Entry<K, V>* = this.buckets[index];
         loop {
             if (node == null) { break; }
-            if (node.hash == h && node.key.equals(key)) {
+            if (node.hash == h && node.key.borrow().equals(&key)) {
                 return Option::Some(&node.value);
             }
             node = node.next;
@@ -484,12 +487,12 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
     /// node.next` write-through-struct-pointer pattern that was
     /// unreliable in earlier codegen paths and documented in the
     /// drop_insertion pass as "bootstrap HashMap remove corruption".
-    public remove(mut &this, key: &K) -> Option<V>
-    where K: Hash + Eq, H: Hasher + Copy {
+    public remove<Q>(mut &this, key: Q) -> Option<V>
+    where K: Hash + Eq + Borrow<Q>, Q: Hash + Eq, H: Hasher + Copy {
         if (this.bucket_count == 0) {
             return Option::None;
         }
-        const h: u64 = hash_key(key, this.hasher);
+        const h: u64 = hash_key(&key, this.hasher);
         const index: u64 = h & (this.bucket_count - 1);
 
         // `cursor` always points to the pointer-slot that links to the
@@ -500,7 +503,7 @@ public type struct HashMap<K, V, A = GlobalAllocator, H = SipHasher> where A: Al
         loop {
             const node: mut Entry<K, V>* = *cursor;
             if (node == null) { break; }
-            if (node.hash == h && node.key.equals(key)) {
+            if (node.hash == h && node.key.borrow().equals(&key)) {
                 *cursor = node.next;               // unlink: single store
                 // Move the value out (see `insert`): the node is freed just
                 // below without running the slot's destructor, so `removed`
