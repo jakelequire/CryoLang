@@ -150,6 +150,16 @@ yet is recorded with the change that builds it, not here.
      refused for v1.0 and gets no overload: `name.as_str()` or an
      f-string is written.  (Jake, the v1 freeze)
 
+735. **An implementation for no named type is a definition of its own.**
+     An implementation whose head names no type definition and no
+     primitive - one for a reference `&T`, a pointer `T*`, a type
+     parameter `T` - is registered by the name layer as a definition of
+     the module it is written in, and its methods are definitions of it.
+     So everything keyed by a method's definition (a generic method's
+     instances among them) works for its methods as for any other's.  An
+     implementation for a named type or a primitive is not one: its
+     methods stay definitions of that type.  (Jake, the v1 freeze)
+
 ### 2026-11-27
 
 728. **An owner is read as its view where the view is declared.**  At

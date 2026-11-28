@@ -377,20 +377,42 @@ type struct NameResolver {
         }
     }
 
-    /// The definition an impl head names as the type its methods belong to:
-    /// the declared type, or the primitive.  Invalid for a head that names
-    /// neither.
-    impl_owner_def(&this, node: ImplBlock*) -> DefId {
+    /// The definition the methods of the implementation `node`, written at
+    /// `span`, belong to: the type its head names, or the primitive.  A head
+    /// that names neither - `for &T`, `for T*`, `for T` - leaves the methods
+    /// no type to belong to, so the implementation is registered here as a
+    /// definition of its own, in the module it is written in, and they
+    /// belong to it.  Invalid for a head the name layer refused or did not
+    /// answer: its own error has been reported.
+    impl_owner_def(&this, node: ImplBlock*, span: SourceSpan) -> DefId {
         return match (node.res) {
             ResSlot::Answered(r) => {
                 match (r) {
                     Res::Def(d)    => { d }
                     Res::PrimTy(p) => { this.ctx.defs.primitive(p) }
-                    _              => { DefId::invalid() }
+                    Res::Err       => { DefId::invalid() }
+                    _              => { this.define_implementation(node, span) }
                 }
             }
             _ => { DefId::invalid() }
         };
+    }
+
+    /// Register the implementation `node`, written at `span`, as a
+    /// definition of the module being resolved.  It has no name of its own:
+    /// its leaf is minted from its head, the trait's leaf and the target as
+    /// written (`Hash for &T`), in the generated space, so no declaration a
+    /// program writes shares its path.
+    define_implementation(&this, node: ImplBlock*, span: SourceSpan) -> DefId {
+        const target: string = this.resolver.intern_table.resolve(node.target_type);
+        const trait_def: DefId = TypeAnnotation::trait_def(node.trait_annotation);
+        const head: string = if (trait_def.is_valid()) {
+            this.resolver.intern_table.resolve(this.ctx.defs.leaf_of(trait_def).spelling()) + " for " + target
+        } else {
+            target
+        };
+        return this.ctx.register_in_module(this.resolver.current_module,
+            this.resolver.intern_table.intern(head), DefKind::Implementation, span);
     }
 
     /// E0243: the explicit import written at `at` brings in `name`, which the
@@ -3788,7 +3810,7 @@ implement trait Walk for struct NameResolver {
         // Declare and visit methods, each a definition of the type the head
         // names - a trait implementation's too: the trait's own method is
         // the trait's definition, the implementation's is the type's.
-        const method_owner: DefId = this.impl_owner_def(node);
+        const method_owner: DefId = this.impl_owner_def(node, decl.span);
         this.declare_type_constants(method_owner,
             node.generic_params.length() > 0 || node.target_args.length() > 0, &node.constants);
         for (mut i: i64 = 0; i < node.methods.length(); i++) {
