@@ -26,6 +26,7 @@ namespace CryoTests::Tests::Stdlib::NetWs;
 
 import std::core::result::{ Result };
 import std::core::option;
+import std::core::pair::{ Pair };
 import std::core::slice;
 import std::collections::str::{ Str };
 import std::collections::string::{ String };
@@ -89,10 +90,10 @@ async function ws_accept_vector_client(port: u16) -> i64 {
 }
 
 async function ws_accept_vector_pair(listener: TcpListener, port: u16) -> i64 {
-    const pair: (i64, i64) = await Futures::join(ws_server_n(listener, 0 as i64),
+    const pair: Pair<i64, i64> = await Futures::join(ws_server_n(listener, 0 as i64),
                                                  ws_accept_vector_client(port));
-    if (pair.0 != 0) { return pair.0; }
-    return pair.1;
+    if (pair.first != 0) { return pair.first; }
+    return pair.second;
 }
 
 /// RFC 6455 section 1.3: `base64(sha1(key + GUID))`.  The canonical worked
@@ -167,9 +168,9 @@ async function ws_key_clients(port: u16) -> i64 {
 }
 
 async function ws_key_pair(listener: TcpListener, port: u16) -> i64 {
-    const pair: (i64, i64) = await Futures::join(ws_key_server(listener), ws_key_clients(port));
-    if (pair.1 != 2) { return pair.1; }
-    return pair.0;
+    const pair: Pair<i64, i64> = await Futures::join(ws_key_server(listener), ws_key_clients(port));
+    if (pair.second != 2) { return pair.second; }
+    return pair.first;
 }
 
 /// A client key is 16 fresh random bytes: 24 base64 characters, a new
@@ -342,12 +343,12 @@ async function ws_server_n(listener: TcpListener, n: i64) -> i64 {
     return seen;
 }
 
-/// Both halves on ONE executor. `Futures::join` completes with a TUPLE.
+/// Both halves on ONE executor. `Futures::join` completes with a `Pair`.
 async function ws_pair(listener: TcpListener, port: u16, n: i64) -> i64 {
-    const pair: (i64, i64) = await Futures::join(ws_server_n(listener, n),
+    const pair: Pair<i64, i64> = await Futures::join(ws_server_n(listener, n),
                                                  ws_client_n(port, n));
-    if (pair.0 != n) { return pair.0; }
-    if (pair.1 != n) { return pair.1; }
+    if (pair.first != n) { return pair.first; }
+    if (pair.second != n) { return pair.second; }
     return n;
 }
 
@@ -457,10 +458,10 @@ async function ws_pipelined_client(port: u16) -> i64 {
 }
 
 async function ws_pipelined_pair(listener: TcpListener, port: u16) -> i64 {
-    const pair: (i64, i64) = await Futures::join(ws_server_n(listener, 1 as i64),
+    const pair: Pair<i64, i64> = await Futures::join(ws_server_n(listener, 1 as i64),
                                                  ws_pipelined_client(port));
-    if (pair.0 != 1) { return pair.0; }
-    return pair.1;
+    if (pair.first != 1) { return pair.first; }
+    return pair.second;
 }
 
 ![test]
@@ -512,10 +513,10 @@ async function ws_ping_client(port: u16) -> i64 {
 }
 
 async function ws_ping_pair(listener: TcpListener, port: u16) -> i64 {
-    const pair: (i64, i64) = await Futures::join(ws_server_n(listener, 1 as i64),
+    const pair: Pair<i64, i64> = await Futures::join(ws_server_n(listener, 1 as i64),
                                                  ws_ping_client(port));
-    if (pair.0 != 1) { return pair.0; }
-    return pair.1;
+    if (pair.first != 1) { return pair.first; }
+    return pair.second;
 }
 
 ![test]
@@ -660,15 +661,15 @@ async function ws_raw_server(listener: TcpListener, case: i64) -> i64 {
     }
 }
 
-async function ws_raw_pair(listener: TcpListener, port: u16, case: i64) -> (i64, i64) {
+async function ws_raw_pair(listener: TcpListener, port: u16, case: i64) -> Pair<i64, i64> {
     return await Futures::join(ws_raw_server(listener, case), ws_raw_client(port, case));
 }
 
 /// The server's result and the status its Close carried, for one case.
-function ws_raw_case(case: i64) -> (i64, i64) {
+function ws_raw_case(case: i64) -> Pair<i64, i64> {
     mut l: TcpListener = match (ws_bind()) {
         Result::Ok(v)  => { v }
-        Result::Err(_) => { return (-1000, -1000); }
+        Result::Err(_) => { return Pair::new(-1000, -1000); }
     };
     const port: u16 = ws_port(&l);
     mut ex: Executor = Executor::new();
@@ -677,38 +678,38 @@ function ws_raw_case(case: i64) -> (i64, i64) {
 
 ![test]
 function close_is_answered_with_its_own_status() -> Result<(), TestError> {
-    const r: (i64, i64) = ws_raw_case(0);
-    expect_equal(r.0, 1 as i64)?;
-    return expect_equal(r.1, 1000 as i64);
+    const r: Pair<i64, i64> = ws_raw_case(0);
+    expect_equal(r.first, 1 as i64)?;
+    return expect_equal(r.second, 1000 as i64);
 }
 
 ![test]
 function text_that_is_not_utf8_fails_the_connection_with_1007() -> Result<(), TestError> {
-    const r: (i64, i64) = ws_raw_case(1);
-    expect_equal(r.0, 1 as i64)?;
-    return expect_equal(r.1, 1007 as i64);
+    const r: Pair<i64, i64> = ws_raw_case(1);
+    expect_equal(r.first, 1 as i64)?;
+    return expect_equal(r.second, 1007 as i64);
 }
 
 ![test]
 function malformed_close_is_answered_with_1002() -> Result<(), TestError> {
-    const short: (i64, i64) = ws_raw_case(2);
-    expect_equal(short.0, 1 as i64)?;
-    expect_equal(short.1, 1002 as i64)?;
-    const reserved: (i64, i64) = ws_raw_case(3);
-    expect_equal(reserved.0, 1 as i64)?;
-    return expect_equal(reserved.1, 1002 as i64);
+    const short: Pair<i64, i64> = ws_raw_case(2);
+    expect_equal(short.first, 1 as i64)?;
+    expect_equal(short.second, 1002 as i64)?;
+    const reserved: Pair<i64, i64> = ws_raw_case(3);
+    expect_equal(reserved.first, 1 as i64)?;
+    return expect_equal(reserved.second, 1002 as i64);
 }
 
 ![test]
 function a_frame_masked_the_wrong_way_is_answered_with_1002() -> Result<(), TestError> {
-    const r: (i64, i64) = ws_raw_case(4);
-    expect_equal(r.0, 1 as i64)?;
-    return expect_equal(r.1, 1002 as i64);
+    const r: Pair<i64, i64> = ws_raw_case(4);
+    expect_equal(r.first, 1 as i64)?;
+    return expect_equal(r.second, 1002 as i64);
 }
 
 ![test]
 function a_close_without_a_status_reports_1005() -> Result<(), TestError> {
-    const r: (i64, i64) = ws_raw_case(5);
-    expect_equal(r.0, 1 as i64)?;
-    return expect_equal(r.1, 1000 as i64);
+    const r: Pair<i64, i64> = ws_raw_case(5);
+    expect_equal(r.first, 1 as i64)?;
+    return expect_equal(r.second, 1000 as i64);
 }

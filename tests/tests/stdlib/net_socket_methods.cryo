@@ -19,6 +19,7 @@ import std::net::address::socket_address::{ SocketAddress };
 import std::net::socket::tcp::{ TcpListener, TcpStream };
 import std::net::socket::udp::{ UdpSocket };
 import std::future::combinator::{ Futures };
+import std::core::pair::{ Pair };
 import std::future::executor::{ Executor };
 import std::test::error::{ TestError };
 import std::test::assert::{ expect, expect_equal };
@@ -88,7 +89,7 @@ async function heard(port: u16) -> i64 {
     };
 }
 
-async function echo_both(listener: TcpListener, port: u16) -> (i64, i64) {
+async function echo_both(listener: TcpListener, port: u16) -> Pair<i64, i64> {
     return await Futures::join(served(listener), heard(port));
 }
 
@@ -98,9 +99,9 @@ function tcp_methods_echo_two_connections_through_one_listener() -> Result<(), T
     const listener: TcpListener = TcpListener::bind(SocketAddress::localhost_v4(0))?;
     const port: u16 = listener.local_address()?.port;
     mut executor: Executor = Executor::new();
-    const outcome: (i64, i64) = executor.block_on(echo_both(listener, port));
-    expect_equal(outcome.0, 20005)?;
-    return expect_equal(outcome.1, 20005);
+    const outcome: Pair<i64, i64> = executor.block_on(echo_both(listener, port));
+    expect_equal(outcome.first, 20005)?;
+    return expect_equal(outcome.second, 20005);
 }
 
 /// Receive one datagram on `receiver`, answer it to its sender, and hear
@@ -110,19 +111,19 @@ async function exchange(sender: UdpSocket, receiver: UdpSocket, receiver_port: u
     mut out: UdpSocket = sender;
     mut back: UdpSocket = receiver;
     const sent: i64 = (await out.send_to(pattern(3, 104), SocketAddress::localhost_v4(receiver_port)))?;
-    const arrived: (Array<u8>, SocketAddress) = (await back.receive_from(64))?;
-    if (arrived.0.as_slice() != pattern(3, 104).as_slice()) { return Result::Ok(-1); }
-    if (arrived.1.port != sender_port) { return Result::Ok(-2); }
-    (await back.send_to(pattern(2, 111), arrived.1))?;
-    const answer: (Array<u8>, SocketAddress) = (await out.receive_from(64))?;
-    if (answer.0.as_slice() != pattern(2, 111).as_slice()) { return Result::Ok(-3); }
+    const arrived: Pair<Array<u8>, SocketAddress> = (await back.receive_from(64))?;
+    if (arrived.first.as_slice() != pattern(3, 104).as_slice()) { return Result::Ok(-1); }
+    if (arrived.second.port != sender_port) { return Result::Ok(-2); }
+    (await back.send_to(pattern(2, 111), arrived.second))?;
+    const answer: Pair<Array<u8>, SocketAddress> = (await out.receive_from(64))?;
+    if (answer.first.as_slice() != pattern(2, 111).as_slice()) { return Result::Ok(-3); }
     // Pinned to each other, the address-less forms.
     out.connect(SocketAddress::localhost_v4(receiver_port))?;
     back.connect(SocketAddress::localhost_v4(sender_port))?;
     (await out.send(pattern(4, 1)))?;
     const pinned: Array<u8> = (await back.receive(64))?;
     if (pinned.as_slice() != pattern(4, 1).as_slice()) { return Result::Ok(-4); }
-    return Result::Ok(sent + answer.0.length() + pinned.length());
+    return Result::Ok(sent + answer.first.length() + pinned.length());
 }
 
 ![test]

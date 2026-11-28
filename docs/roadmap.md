@@ -653,7 +653,8 @@ language's features; each is a branch of its own after the merge.
 
 Jake decided each of these during the standard library's v1 freeze: a v1.0
 form, and the designed path after v1.0.  The first two v1.0 forms are the
-language as it is; the last two are still to be built before v1.0.
+language as it is, and the third is built; the last is still to be built
+before v1.0.
 
 - **Mixed text `==`.**  For v1.0, `==` takes one type on both sides, so
   `view == Str::new("abc")` and `owned.as_str() == view` are written out.
@@ -666,10 +667,11 @@ language as it is; the last two are still to be built before v1.0.
   v1.0, as part of option C: a literal whose type nothing declares is a
   `Str`, so `"a,b".contains(",")` finds `Str`'s methods with no change to
   member lookup.
-- **Two values together.**  `Pair` is the one convention for a two-value
-  result, moved into `core` so `core`'s own results can name it; the tuple
-  results (`overflowing_*`, `u64::parse_radix_prefix`, `Futures::join` and
-  `try_join`, `UdpSocket.receive_from`) become `Pair`.  After
+- **Two values together.**  `Pair` (`std::core::pair`) is the one
+  convention for a public two-value result, in `core` so `core`'s own
+  results name it: `overflowing_*`, `u64::parse_radix_prefix`,
+  `Futures::join` and `try_join`, `UdpSocket.receive_from`.  A result
+  internal to the library may stay a tuple.  After
   v1.0: tuples gain `Eq`, `Clone`, `Debug` and `Display` structurally, as
   they have `Copy`, `Send` and `Sync`, and a method call on a tuple.
 - **A loop over a collection.**  `for (x in xs)` over an array consumes it,
