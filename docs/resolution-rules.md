@@ -133,6 +133,23 @@ Decisions Jake made in plain text on questions the rules above leave open.
 Each is stated as the behaviour it requires; whether the compiler has it
 yet is recorded with the change that builds it, not here.
 
+### 2026-11-28
+
+733. **A pointer is not read where its pointee's type is declared.**  A
+     `T*` passed where `T` is declared is refused everywhere a `&T` is
+     (731), with the fix writing `*value`: `iterate_references()` yields
+     a `T*`, and a free function used to read through it while a static
+     method and an enum payload took its address.  (Jake, the v1 freeze)
+
+734. **The freeze's last smaller calls.**  A result internal to the
+     standard library may stay a tuple; only a public two-value result is
+     a `Pair`.  The owner-as-view read of 728 keeps reading any `Copy`
+     `Deref` target.  Member lookup on an unbounded type parameter does
+     not ask the heads for every type (`T::from(value)` needs its bound
+     written), as 729 says.  `fmt::println(name)` with a `String` stays
+     refused for v1.0 and gets no overload: `name.as_str()` or an
+     f-string is written.  (Jake, the v1 freeze)
+
 ### 2026-11-27
 
 728. **An owner is read as its view where the view is declared.**  At
@@ -164,8 +181,8 @@ yet is recorded with the change that builds it, not here.
      A `&T` passed where `T` is declared is refused everywhere (E0214),
      with the fix writing `*value`: a free function read through it, a
      static method and an enum payload took its address, and an instance
-     method was refused as a missing method.  A `T*` for `T` is not
-     covered by this ruling.  (Jake, the v1 freeze)
+     method was refused as a missing method.  A `T*` for `T` is 733's.
+     (Jake, the v1 freeze)
 
 732. **The freeze's smaller calls stand as built.**  A scoped thread's
      panic that a `join` collected belongs to the caller of `join`; the
